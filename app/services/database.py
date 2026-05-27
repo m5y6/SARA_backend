@@ -190,6 +190,243 @@ class DatabaseService:
             if conn:
                 conn.close()
 
+    def seed_roles(self, default_roles: Optional[List[Dict[str, str]]] = None) -> bool:
+        """Ensure the `roles` table has the default roles.
+
+        If the table is empty, insert the provided `default_roles` (list of dicts with
+        `nombre` and optional `descripcion`). Returns True if seeding occurred.
+        """
+        roles_to_insert = default_roles or [
+            {"nombre": "admin", "descripcion": "Administrador del sistema"},
+            {"nombre": "user", "descripcion": "Usuario estándar"},
+            {"nombre": "uploader", "descripcion": "Usuario con permisos de carga"},
+        ]
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # Prefer the `roles` table (plural) used on RDS; create if missing.
+            table_name = 'roles'
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = %s)",
+                (table_name,)
+            )
+            exists = cursor.fetchone()[0]
+            if not exists:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        id SERIAL PRIMARY KEY,
+                        nombre VARCHAR(255) UNIQUE NOT NULL,
+                        descripcion TEXT
+                    )
+                    """
+                )
+                conn.commit()
+
+            # Ensure expected columns exist; add them if missing to support older schemas.
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = %s AND column_name = %s)",
+                (table_name, 'nombre'),
+            )
+            nombre_exists = cursor.fetchone()[0]
+            if not nombre_exists:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN nombre VARCHAR(255)")
+
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = %s AND column_name = %s)",
+                (table_name, 'descripcion'),
+            )
+            descripcion_exists = cursor.fetchone()[0]
+            if not descripcion_exists:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN descripcion TEXT")
+            conn.commit()
+
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            count = cursor.fetchone()[0]
+            if count and int(count) > 0:
+                return False
+
+            for r in roles_to_insert:
+                nombre = r.get("nombre")
+                descripcion = r.get("descripcion")
+                cursor.execute(f"SELECT 1 FROM {table_name} WHERE nombre = %s", (nombre,))
+                if cursor.fetchone():
+                    continue
+                cursor.execute(
+                    f"INSERT INTO {table_name} (nombre, descripcion) VALUES (%s, %s)",
+                    (nombre, descripcion),
+                )
+            conn.commit()
+            return True
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to seed roles: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+    def list_roles(self) -> List[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT id, nombre, permisos FROM roles ORDER BY id")
+            return cursor.fetchall()
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to list roles: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def list_users(self) -> List[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(
+                "SELECT u.id, u.nombre, u.email, u.rol_id, r.nombre AS role_name FROM usuarios u LEFT JOIN roles r ON u.rol_id = r.id ORDER BY u.id"
+            )
+            return cursor.fetchall()
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to list users: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_role_by_name(self, role_name: str) -> Optional[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT id, nombre, permisos FROM roles WHERE nombre = %s", (role_name,))
+            return cursor.fetchone()
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to get role by name: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def update_user_role(self, user_id: int, role_id: Optional[int], performed_by: Optional[int] = None) -> None:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE usuarios SET rol_id = %s WHERE id = %s", (role_id, user_id))
+            # audit
+            cursor.execute(
+                "INSERT INTO role_audit_log (action, performed_by, target_user, role_id, details) VALUES (%s,%s,%s,%s,%s)",
+                ("assign_role", performed_by, user_id, role_id, None),
+            )
+            conn.commit()
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to update user role: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def update_role_permisos(self, role_id: int, permisos: Any, performed_by: Optional[int] = None) -> None:
+        import json
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            permisos_json = json.dumps(permisos) if permisos is not None else None
+            cursor.execute("UPDATE roles SET permisos = %s WHERE id = %s", (permisos_json, role_id))
+            cursor.execute(
+                "INSERT INTO role_audit_log (action, performed_by, target_user, role_id, details) VALUES (%s,%s,%s,%s,%s)",
+                ("update_role_permisos", performed_by, None, role_id, permisos_json),
+            )
+            conn.commit()
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to update role permisos: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def list_role_audit(self, limit: int = 50) -> List[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT * FROM role_audit_log ORDER BY created_at DESC LIMIT %s", (limit,))
+            return cursor.fetchall()
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to list role audit log: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(
+                "SELECT u.id, u.nombre, u.email, u.rol_id, r.nombre AS role_name FROM usuarios u LEFT JOIN roles r ON u.rol_id = r.id WHERE u.id = %s",
+                (user_id,)
+            )
+            return cursor.fetchone()
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to get user: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def update_user(self, user_id: int, nombre: Optional[str] = None, email: Optional[str] = None, role_id: Optional[int] = None, performed_by: Optional[int] = None) -> None:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            updates = []
+            params = []
+            if nombre is not None:
+                updates.append("nombre = %s")
+                params.append(nombre)
+            if email is not None:
+                updates.append("email = %s")
+                params.append(email)
+
+            if updates:
+                params.extend([user_id])
+                sql = f"UPDATE usuarios SET {', '.join(updates)} WHERE id = %s"
+                cursor.execute(sql, tuple(params))
+
+            # Handle role change via dedicated method which also audits
+            if role_id is not None:
+                # use update_user_role which writes an audit entry
+                self.update_user_role(user_id=user_id, role_id=role_id, performed_by=performed_by)
+
+            # audit update of user fields
+            details = {
+                "updated_fields": {
+                    k.split(' = ')[0]: v for k, v in zip(updates, params[:len(updates)])
+                }
+            } if updates else None
+
+            if details:
+                import json
+                cursor.execute(
+                    "INSERT INTO role_audit_log (action, performed_by, target_user, role_id, details) VALUES (%s,%s,%s,%s,%s)",
+                    ("update_user", performed_by, user_id, None, json.dumps(details)),
+                )
+
+            conn.commit()
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to update user: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
 
 _db_service: DatabaseService = None
 

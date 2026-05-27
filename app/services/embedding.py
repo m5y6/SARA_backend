@@ -3,8 +3,7 @@ Embedding service using fastembed.
 Converts text into vector embeddings for semantic search.
 """
 
-from fastembed import TextEmbedding
-from typing import List
+from typing import List, Any
 from app.core.config import settings
 
 
@@ -13,11 +12,23 @@ class EmbeddingService:
 
     def __init__(self, model_name: str = None):
         self.model_name = model_name or settings.embedding_model
-        self.model = TextEmbedding(model_name=self.model_name)
+        # Import fastembed lazily so the app can start even if the package
+        # is not installed. If it's missing, we keep `self.model` as None
+        # and raise a clear error when embedding is attempted.
+        try:
+            from fastembed import TextEmbedding  # type: ignore
+        except ModuleNotFoundError:
+            self.model = None
+            return
+
+        self.model: Any = TextEmbedding(model_name=self.model_name)
 
     def embed_text(self, text: str) -> List[float]:
         if not text or not text.strip():
             raise ValueError("Text cannot be empty")
+        if self.model is None:
+            raise RuntimeError("fastembed is not installed; install it to use embeddings")
+
         embeddings = list(self.model.embed([text]))
         if not embeddings:
             raise ValueError("Failed to generate embedding")
@@ -26,6 +37,9 @@ class EmbeddingService:
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             raise ValueError("Texts list cannot be empty")
+        if self.model is None:
+            raise RuntimeError("fastembed is not installed; install it to use embeddings")
+
         embeddings = list(self.model.embed(texts))
         return [embedding.tolist() for embedding in embeddings]
 

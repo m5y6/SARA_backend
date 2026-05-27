@@ -12,7 +12,7 @@ from app.services.database import get_database_service
 from app.services.llm_gemini import get_gemini_service
 from app.services.text_normalization import normalize_text
 from app.services.s3_storage import get_s3_storage_service
-from app.services.auth import authenticate_user, create_access_token, get_current_user, require_admin
+from app.services.auth import authenticate_user, create_access_token, get_current_user, require_admin, require_permission, require_admin_or_permission
 import logging
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ class LoginResponse(BaseModel):
     name: str
     email: str
     role: str
+    permisos: Optional[Dict[str, Any]] = None
 
 
 class NormalizeTextRequest(BaseModel):
@@ -87,6 +88,7 @@ async def login(request: LoginRequest) -> LoginResponse:
             "name": user["name"],
             "email": user["email"],
             "role": user["role"],
+            "permisos": user.get("permisos"),
         })
         return LoginResponse(
             access_token=token,
@@ -94,6 +96,7 @@ async def login(request: LoginRequest) -> LoginResponse:
             name=user["name"],
             email=user["email"],
             role=user["role"] or "user",
+            permisos=user.get("permisos"),
         )
     except HTTPException:
         raise
@@ -209,7 +212,7 @@ async def normalize_document_text(request: NormalizeTextRequest) -> NormalizeTex
 async def upload_txt_to_s3(
     file: UploadFile = File(...),
     file_name: str = Form(...),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_permission('upload')),
 ) -> UploadTxtResponse:
     try:
         if file.content_type not in {"text/plain", "text/txt", "application/octet-stream"}:
@@ -239,3 +242,144 @@ async def upload_txt_to_s3(
     except Exception as e:
         logger.error(f"TXT upload error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error uploading TXT file.")
+
+
+# Admin models and endpoints
+class AdminRole(BaseModel):
+    id: int
+    nombre: str
+    permisos: Optional[Dict[str, Any]] = None
+
+
+class AdminUser(BaseModel):
+    id: int
+    nombre: str
+    email: str
+    rol_id: Optional[int] = None
+    role_name: Optional[str] = None
+
+
+class AssignRoleRequest(BaseModel):
+    role_id: Optional[int] = None
+    role_name: Optional[str] = None
+
+
+class AdminUserUpdate(BaseModel):
+    nombre: Optional[str] = None
+    email: Optional[str] = None
+    role_id: Optional[int] = None
+    role_name: Optional[str] = None
+
+
+class UpdatePermisosRequest(BaseModel):
+    permisos: Optional[Dict[str, Any]] = None
+
+
+@router.get("/admin/roles", response_model=List[AdminRole])
+async def admin_list_roles(current_user: Dict[str, Any] = Depends(require_admin)) -> List[AdminRole]:
+    try:
+        db = get_database_service()
+        roles = db.list_roles()
+        return [AdminRole(**r) for r in roles]
+    except Exception as e:
+        logger.error(f"List roles error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list roles")
+
+
+@router.get("/admin/users", response_model=List[AdminUser])
+async def admin_list_users(current_user: Dict[str, Any] = Depends(require_admin)) -> List[AdminUser]:
+    try:
+        db = get_database_service()
+        users = db.list_users()
+        return [AdminUser(**u) for u in users]
+    except Exception as e:
+        logger.error(f"List users error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list users")
+
+
+@router.get("/admin/users/{user_id}", response_model=AdminUser)
+async def admin_get_user(user_id: int, current_user: Dict[str, Any] = Depends(require_admin)) -> AdminUser:
+    try:
+        db = get_database_service()
+        user = db.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        return AdminUser(**user)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get user error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get user")
+
+
+@router.patch("/admin/users/{user_id}", response_model=AdminUser)
+async def admin_patch_user(user_id: int, body: AdminUserUpdate, current_user: Dict[str, Any] = Depends(require_admin)):
+    try:
+        db = get_database_service()
+        # resolve role_id if role_name provided
+        role_id = body.role_id
+        if role_id is None and body.role_name:
+            role = db.get_role_by_name(body.role_name)
+            if not role:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+            role_id = role["id"]
+
+        db.update_user(
+            user_id=user_id,
+            nombre=body.nombre,
+            email=body.email,
+            role_id=role_id,
+            performed_by=int(current_user.get("user_id")),
+        )
+
+        updated = db.get_user(user_id)
+        if not updated:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="User updated but could not be retrieved")
+        return AdminUser(**updated)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Patch user error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update user")
+
+
+@router.patch("/admin/users/{user_id}/role")
+async def admin_assign_role(user_id: int, body: AssignRoleRequest, current_user: Dict[str, Any] = Depends(require_admin)):
+    try:
+        db = get_database_service()
+        role_id = body.role_id
+        if role_id is None and body.role_name:
+            role = db.get_role_by_name(body.role_name)
+            if not role:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+            role_id = role["id"]
+
+        db.update_user_role(user_id=user_id, role_id=role_id, performed_by=int(current_user.get("user_id")))
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Assign role error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to assign role")
+
+
+@router.patch("/admin/roles/{role_id}/permisos")
+async def admin_update_role_permisos(role_id: int, body: UpdatePermisosRequest, current_user: Dict[str, Any] = Depends(require_admin)):
+    try:
+        db = get_database_service()
+        db.update_role_permisos(role_id=role_id, permisos=body.permisos, performed_by=int(current_user.get("user_id")))
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Update role permisos error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update role permisos")
+
+
+@router.get("/admin/roles/audit", response_model=List[Dict[str, Any]])
+async def admin_list_role_audit(current_user: Dict[str, Any] = Depends(require_admin)):
+    try:
+        db = get_database_service()
+        entries = db.list_role_audit()
+        return entries
+    except Exception as e:
+        logger.error(f"List role audit error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to list role audit log")

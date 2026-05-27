@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 import logging
 from app.core.config import settings
 from app.api.routes import router as api_router
+from app.services.database import get_database_service
+from starlette.concurrency import run_in_threadpool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +66,22 @@ async def startup_event():
     logger.info(f"LLM Model: {settings.llm_model}")
     logger.info(f"Database: {settings.db_host}:{settings.db_port}/{settings.db_name}")
     logger.info("=" * 50)
+
+    # Seed `roles` table with default roles if it's empty
+    try:
+        db = get_database_service()
+        default_roles = [
+            {"nombre": "admin", "descripcion": "Administrador del sistema"},
+            {"nombre": "user", "descripcion": "Usuario estándar"},
+            {"nombre": "uploader", "descripcion": "Usuario con permisos de carga"},
+        ]
+        seeded = await run_in_threadpool(db.seed_roles, default_roles)
+        if seeded:
+            logger.info("Default roles inserted into 'roles' table.")
+        else:
+            logger.info("'roles' table already populated.")
+    except Exception as e:
+        logger.error(f"Role seeding failed: {str(e)}")
 
 
 @app.on_event("shutdown")

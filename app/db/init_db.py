@@ -74,6 +74,17 @@ DDL = [
         vector_id INT REFERENCES fragmentos_vectores(id) ON DELETE CASCADE
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS role_audit_log (
+        id SERIAL PRIMARY KEY,
+        action VARCHAR(100) NOT NULL,
+        performed_by INT REFERENCES usuarios(id) ON DELETE SET NULL,
+        target_user INT REFERENCES usuarios(id) ON DELETE SET NULL,
+        role_id INT REFERENCES roles(id) ON DELETE SET NULL,
+        details JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
 ]
 
 
