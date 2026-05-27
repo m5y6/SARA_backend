@@ -17,6 +17,25 @@ class GeminiService:
         genai.configure(api_key=self.api_key)
         self.model = genai.GenerativeModel(self.model_name)
 
+    def _get_fallback_model_names(self) -> List[str]:
+        candidates = [
+            self.model_name,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-flash-001",
+            "gemini-2.0-flash",
+            "gemini-flash-latest",
+            "gemini-1.5-flash-002",
+            "gemini-1.5-pro",
+        ]
+        seen = set()
+        unique_candidates = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                unique_candidates.append(candidate)
+        return unique_candidates
+
     def _build_system_prompt(self) -> str:
         return """You are SARA (Sistema de Asistencia de Reglamentos Académicos), 
 an expert assistant for academic regulations.
@@ -52,20 +71,39 @@ Document Fragments:
         if not question or not question.strip():
             raise ValueError("Question cannot be empty")
         max_tokens = max_tokens or settings.max_tokens
-        try:
-            user_prompt = self._build_user_prompt(question, fragments)
-            response = self.model.generate_content(
-                user_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                ),
-            )
-            if not response.text:
-                raise ValueError("Empty response from Gemini API")
-            return response.text
-        except Exception as e:
-            raise Exception(f"Gemini API call failed: {str(e)}")
+        user_prompt = self._build_user_prompt(question, fragments)
+        last_error: Optional[Exception] = None
+
+        for model_name in self._get_fallback_model_names():
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    user_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                if not response.text:
+                    raise ValueError("Empty response from Gemini API")
+                self.model_name = model_name
+                self.model = model
+                return response.text
+            except Exception as e:
+                last_error = e
+                message = str(e).lower()
+                retryable = (
+                    "404" in message
+                    or "not found" in message
+                    or "not supported" in message
+                    or "quota" in message
+                    or "rate limit" in message
+                    or "exceeded" in message
+                )
+                if not retryable:
+                    break
+
+        raise Exception(f"Gemini API call failed: {str(last_error)}")
 
     def generate_rag_response(
         self,

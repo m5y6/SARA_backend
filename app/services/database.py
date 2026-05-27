@@ -47,11 +47,10 @@ class DatabaseService:
             query = """
                 SELECT
                     v.id as id,
-                    v.contenido_texto as contenido_texto,
-                    d.titulo as titulo,
+                    v.contenido as contenido_texto,
+                    COALESCE(v.metadata->>'titulo', v.metadata->>'source') as titulo,
                     (1 - (v.embedding <=> %s::vector)) as similarity
                 FROM fragmentos_vectores v
-                JOIN documentos_oficiales d ON v.documento_id = d.id
                 WHERE (1 - (v.embedding <=> %s::vector)) >= %s
                 ORDER BY v.embedding <=> %s::vector
                 LIMIT %s

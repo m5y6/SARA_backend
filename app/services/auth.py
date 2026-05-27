@@ -121,7 +121,13 @@ def authenticate_user(email: str, password: str) -> Dict[str, Any]:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
         user_id, nombre, user_email, password_hash, role_name, role_permisos = row
-        if not verify_password(password, password_hash):
+        try:
+            password_valid = verify_password(password, password_hash)
+        except Exception:
+            # Stored hash is invalid/corrupted or not from passlib; treat as bad credentials.
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+        if not password_valid:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
         role_slug = (role_name or "").strip().lower()

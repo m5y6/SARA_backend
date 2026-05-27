@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     frontend_url: str = "http://localhost:3000"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384
-    llm_model: str = "gemini-1.5-flash"
+    llm_model: str = "gemini-2.5-flash"
     max_tokens: int = 2048
     top_k_fragments: int = 3
     similarity_threshold: float = 0.3
