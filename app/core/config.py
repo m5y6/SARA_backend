@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     max_tokens: int = 2048
     top_k_fragments: int = 3
     similarity_threshold: float = 0.3
+    aws_region: str = "us-east-1"
+    s3_bucket_name: str
+    s3_prefix: str = "documents/"
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
 
     class Config:
         env_file = ".env"

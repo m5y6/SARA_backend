@@ -5,7 +5,7 @@ Performs semantic search on academic regulations using pgvector.
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from app.core.config import settings
 
 
@@ -24,6 +24,7 @@ class DatabaseService:
     def _get_connection(self):
         try:
             conn = psycopg2.connect(**self.db_config)
+            conn.autocommit = False
             return conn
         except psycopg2.Error as e:
             raise Exception(f"Database connection failed: {str(e)}")
@@ -43,28 +44,28 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            
             query = """
-                SELECT 
-                    id,
-                    contenido,
-                    metadata,
-                    (1 - (embedding <=> %s::vector)) as similarity
-                FROM fragmentos_vectores
-                WHERE (1 - (embedding <=> %s::vector)) >= %s
-                ORDER BY embedding <=> %s::vector
+                SELECT
+                    v.id as id,
+                    v.contenido_texto as contenido_texto,
+                    d.titulo as titulo,
+                    (1 - (v.embedding <=> %s::vector)) as similarity
+                FROM fragmentos_vectores v
+                JOIN documentos_oficiales d ON v.documento_id = d.id
+                WHERE (1 - (v.embedding <=> %s::vector)) >= %s
+                ORDER BY v.embedding <=> %s::vector
                 LIMIT %s
             """
-            
+
             embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
             cursor.execute(query, (embedding_str, embedding_str, threshold, embedding_str, top_k))
             results = cursor.fetchall()
-            
+
             formatted_results = [
                 {
                     "id": row["id"],
-                    "contenido": row["contenido"],
-                    "metadata": row["metadata"],
+                    "contenido_texto": row["contenido_texto"],
+                    "titulo": row.get("titulo"),
                     "similarity": float(row["similarity"]),
                 }
                 for row in results
@@ -86,6 +87,105 @@ class DatabaseService:
             return True
         except psycopg2.Error as e:
             raise Exception(f"Database health check failed: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def create_session(self, usuario_id: Optional[int] = None) -> int:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO sesiones_chat (usuario_id) VALUES (%s) RETURNING id", (usuario_id,))
+            session_id = cursor.fetchone()[0]
+            conn.commit()
+            return session_id
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to create session: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def save_interaction(self, sesion_id: int, pregunta: str, respuesta: str, tiempo_ms: Optional[int] = None) -> int:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO interacciones (sesion_id, pregunta_usuario, respuesta_ia, tiempo_respuesta_ms) VALUES (%s,%s,%s,%s) RETURNING id",
+                (sesion_id, pregunta, respuesta, tiempo_ms)
+            )
+            interaction_id = cursor.fetchone()[0]
+            conn.commit()
+            return interaction_id
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to save interaction: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def save_references(self, interaccion_id: int, vector_ids: List[int]) -> None:
+        if not vector_ids:
+            return
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            args_str = ",".join(["(%s,%s)" for _ in vector_ids])
+            params = []
+            for vid in vector_ids:
+                params.extend([interaccion_id, vid])
+            cursor.execute(
+                f"INSERT INTO referencias_contexto (interaccion_id, vector_id) VALUES {args_str}",
+                tuple(params)
+            )
+            conn.commit()
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to save references: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def save_chat_transaction(
+        self,
+        sesion_id: int,
+        pregunta: str,
+        respuesta: str,
+        vector_ids: List[int],
+        tiempo_ms: Optional[int] = None,
+    ) -> int:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO interacciones (sesion_id, pregunta_usuario, respuesta_ia, tiempo_respuesta_ms) VALUES (%s,%s,%s,%s) RETURNING id",
+                (sesion_id, pregunta, respuesta, tiempo_ms),
+            )
+            interaction_id = cursor.fetchone()[0]
+
+            if vector_ids:
+                values_sql = ",".join(["(%s,%s)" for _ in vector_ids])
+                params = []
+                for vector_id in vector_ids:
+                    params.extend([interaction_id, vector_id])
+                cursor.execute(
+                    f"INSERT INTO referencias_contexto (interaccion_id, vector_id) VALUES {values_sql}",
+                    tuple(params),
+                )
+
+            conn.commit()
+            return interaction_id
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to save chat transaction: {str(e)}")
         finally:
             if conn:
                 conn.close()
