@@ -16,7 +16,18 @@ class S3StorageService:
         self.bucket_name = bucket_name or settings.s3_bucket_name
         self.region_name = region_name or settings.aws_region
         self.prefix = settings.s3_prefix.strip("/")
-        self.client = boto3.client("s3", region_name=self.region_name)
+        client_kwargs = {"region_name": self.region_name}
+        if settings.aws_access_key_id and settings.aws_secret_access_key:
+            client_kwargs["aws_access_key_id"] = settings.aws_access_key_id
+            client_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
+            if settings.aws_session_token:
+                client_kwargs["aws_session_token"] = settings.aws_session_token
+        elif settings.aws_profile:
+            session = boto3.Session(profile_name=settings.aws_profile, region_name=self.region_name)
+            self.client = session.client("s3")
+            return
+
+        self.client = boto3.client("s3", **client_kwargs)
 
     @staticmethod
     def build_object_name(file_name: str) -> str:
@@ -24,9 +35,8 @@ class S3StorageService:
             raise ValueError("File name cannot be empty")
 
         safe_name = PurePosixPath(file_name.strip()).name
-        if not safe_name.lower().endswith(".txt"):
-            safe_name = f"{safe_name}.txt"
-        return safe_name
+        stem = PurePosixPath(safe_name).stem or safe_name
+        return f"{stem}.txt"
 
     def build_object_key(self, file_name: str) -> str:
         object_name = self.build_object_name(file_name)

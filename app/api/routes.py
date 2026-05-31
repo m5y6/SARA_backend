@@ -6,11 +6,14 @@ Defines endpoints for auth, asking questions about academic regulations and TXT 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, status, Depends
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
+import re
+import unicodedata
 import time
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from app.services.embedding import get_embedding_service
 from app.services.database import get_database_service
 from app.services.llm_gemini import get_gemini_service
-from app.services.text_normalization import normalize_text
+from app.services.text_normalization import normalize_text, prepare_document_text, extract_uploaded_document_text
 from app.services.s3_storage import get_s3_storage_service
 from app.services.auth import authenticate_user, create_access_token, get_current_user, require_admin, require_permission, require_admin_or_permission
 import logging
@@ -78,6 +81,74 @@ class UploadTxtResponse(BaseModel):
     normalized_length: int
 
 
+def _normalize_intent_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text.lower())
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"[^a-z0-9\s?¿!¡]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _is_greeting_or_identity_message(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    if not normalized:
+        return False
+
+    academic_markers = (
+        "reglamento",
+        "reglamentos",
+        "articulo",
+        "artículos",
+        "articulo",
+        "alumno",
+        "alumna",
+        "inasistencia",
+        "inasistencias",
+        "semestre",
+        "nota",
+        "evaluacion",
+        "evaluación",
+        "malla",
+        "carrera",
+        "examen",
+        "calificacion",
+        "calificación",
+        "titulo",
+        "título",
+    )
+    if any(marker in normalized for marker in academic_markers):
+        return False
+
+    greeting_patterns = (
+        r"^(hola+|buenas|buenos dias|buenas tardes|buenas noches|saludos)\b",
+        r"^(que tal|que onda|holi|hey|hi)\b",
+    )
+    identity_patterns = (
+        r"\b(eres|estas|sos) gemini\b",
+        r"\bquien eres\b",
+        r"\bque eres\b",
+        r"\beres una ia\b",
+        r"\beres inteligencia artificial\b",
+    )
+
+    return any(re.search(pattern, normalized) for pattern in greeting_patterns + identity_patterns)
+
+
+def _build_direct_chat_response(question: str) -> Dict[str, Any]:
+    normalized = _normalize_intent_text(question)
+    if re.search(r"\b(eres|estas|sos) gemini\b|\bquien eres\b|\bque eres\b|\beres una ia\b", normalized):
+        answer = "No, soy SARA. Puedo ayudarte con reglamentos académicos y consultas basadas en documentos."
+    else:
+        answer = "Hola, soy SARA. Puedo ayudarte con reglamentos académicos y consultas basadas en documentos."
+
+    return {
+        "answer": answer,
+        "fragments_used": 0,
+        "fragments": [],
+        "model": "rule-based",
+    }
+
+
 @router.post("/auth/login", response_model=LoginResponse)
 async def login(request: LoginRequest) -> LoginResponse:
     try:
@@ -111,9 +182,41 @@ async def ask_question(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> QuestionResponse:
     try:
+        if _is_greeting_or_identity_message(request.question):
+            response_data = _build_direct_chat_response(request.question)
+            db_service = get_database_service()
+            tiempo_ms = 0
+
+            if request.sesion_id:
+                session_owner = db_service.get_session_owner(request.sesion_id)
+                if session_owner is None:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+                if int(session_owner) != int(current_user["user_id"]):
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to current user")
+                sesion_id = request.sesion_id
+            else:
+                sesion_id = db_service.create_session(int(current_user["user_id"]))
+
+            db_service.save_chat_transaction(
+                sesion_id=sesion_id,
+                pregunta=request.question,
+                respuesta=response_data["answer"],
+                vector_ids=[],
+                tiempo_ms=tiempo_ms,
+            )
+
+            return QuestionResponse(
+                answer=response_data["answer"],
+                fragments_used=0,
+                fragments=[],
+                model=response_data["model"],
+            )
+
         logger.info(f"Generating embedding for question: {request.question[:50]}...")
         embedding_service = get_embedding_service()
         question_embedding = embedding_service.embed_text(request.question)
+        gemini_service = get_gemini_service()
+        start_ts = time.time()
         
         logger.info("Searching for similar fragments...")
         db_service = get_database_service()
@@ -121,17 +224,18 @@ async def ask_question(
         
         if not fragments:
             logger.warning(f"No fragments found")
+            response_data = gemini_service.generate_fallback_response(
+                question=request.question,
+                temperature=request.temperature,
+            )
         else:
             logger.info(f"Found {len(fragments)} fragments")
-        
-        logger.info("Generating response...")
-        gemini_service = get_gemini_service()
-        start_ts = time.time()
-        response_data = gemini_service.generate_rag_response(
-            question=request.question,
-            fragments=fragments,
-            temperature=request.temperature
-        )
+            logger.info("Generating response...")
+            response_data = gemini_service.generate_rag_response(
+                question=request.question,
+                fragments=fragments,
+                temperature=request.temperature
+            )
         tiempo_ms = int((time.time() - start_ts) * 1000)
 
         if request.sesion_id:
@@ -208,21 +312,17 @@ async def normalize_document_text(request: NormalizeTextRequest) -> NormalizeTex
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid input: {str(e)}")
 
 
+@router.post("/upload-document", response_model=UploadTxtResponse)
 @router.post("/upload-txt", response_model=UploadTxtResponse)
-async def upload_txt_to_s3(
+async def upload_document_to_s3(
     file: UploadFile = File(...),
     file_name: str = Form(...),
     current_user: Dict[str, Any] = Depends(require_admin_or_permission('upload')),
 ) -> UploadTxtResponse:
     try:
-        if file.content_type not in {"text/plain", "text/txt", "application/octet-stream"}:
-            raise ValueError("Only TXT files are allowed")
-
-        if not file.filename or not file.filename.lower().endswith(".txt"):
-            raise ValueError("Only TXT files are allowed")
-
-        raw_content = (await file.read()).decode("utf-8")
-        normalized_content = normalize_text(raw_content)
+        raw_content = await file.read()
+        source_name = file.filename or file_name
+        normalized_content = extract_uploaded_document_text(source_name, raw_content)
 
         s3_service = get_s3_storage_service()
         s3_key = s3_service.upload_text(file_name=file_name, content=normalized_content)
@@ -234,14 +334,18 @@ async def upload_txt_to_s3(
             original_length=len(raw_content),
             normalized_length=len(normalized_content),
         )
-    except UnicodeDecodeError:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TXT file must be UTF-8 encoded")
     except ValueError as e:
-        logger.error(f"TXT upload validation error: {str(e)}")
+        logger.error(f"Document upload validation error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid input: {str(e)}")
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        logger.error(f"AWS credentials error during document upload: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AWS credentials are not configured for document upload.",
+        )
     except Exception as e:
-        logger.error(f"TXT upload error: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error uploading TXT file.")
+        logger.error(f"Document upload error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error uploading document file.")
 
 
 # Admin models and endpoints

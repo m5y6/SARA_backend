@@ -61,6 +61,23 @@ Document Fragments:
         prompt += f"\n---\n\nUser Question: {question}\n\nAnswer:"
         return prompt
 
+    def _build_fallback_prompt(self, question: str) -> str:
+        return f"""You are SARA (Sistema de Asistencia de Reglamentos Académicos).
+
+No relevant fragments were found in the vectorized academic regulations database for this question.
+
+Instructions:
+1. Answer in Spanish.
+2. If this is a greeting or small talk, reply naturally and briefly.
+3. If this is an academic, institutional, or regulatory question, do not answer it from general knowledge.
+4. In that case, say that no relevant information was found in the vectorized academic regulations available.
+5. Do not invent specific regulations, articles, institutional rules, or answers you are not certain about.
+6. Keep the response short and avoid adding unsupported details.
+
+User Question: {question}
+
+Answer:"""
+
     def generate_response(
         self,
         question: str,
@@ -117,6 +134,53 @@ Document Fragments:
             "fragments_used": len(fragments),
             "fragments": fragments,
         }
+
+    def generate_fallback_response(
+        self,
+        question: str,
+        temperature: float = 0.3,
+    ) -> Dict[str, Any]:
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty")
+
+        max_tokens = settings.max_tokens
+        fallback_prompt = self._build_fallback_prompt(question)
+        last_error: Optional[Exception] = None
+
+        for model_name in self._get_fallback_model_names():
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(
+                    fallback_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    ),
+                )
+                if not response.text:
+                    raise ValueError("Empty response from Gemini API")
+                self.model_name = model_name
+                self.model = model
+                return {
+                    "answer": response.text,
+                    "fragments_used": 0,
+                    "fragments": [],
+                }
+            except Exception as e:
+                last_error = e
+                message = str(e).lower()
+                retryable = (
+                    "404" in message
+                    or "not found" in message
+                    or "not supported" in message
+                    or "quota" in message
+                    or "rate limit" in message
+                    or "exceeded" in message
+                )
+                if not retryable:
+                    break
+
+        raise Exception(f"Gemini API call failed: {str(last_error)}")
 
 
 _gemini_service: GeminiService = None
