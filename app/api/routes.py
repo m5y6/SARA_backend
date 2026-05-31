@@ -350,7 +350,22 @@ async def upload_document_to_s3(
         normalized_content = extract_uploaded_document_text(source_name, raw_content)
 
         s3_service = get_s3_storage_service()
-        s3_key = s3_service.upload_text(file_name=file_name, content=normalized_content)
+        s3_key = s3_service.build_object_key(file_name)
+
+        db_service = get_database_service()
+        db_service.create_document_record(
+            titulo=s3_service.build_object_name(file_name),
+            ruta_s3=s3_key,
+            subido_por=int(current_user.get("user_id")) if current_user.get("user_id") is not None else None,
+            estado="uploading",
+        )
+
+        try:
+            s3_key = s3_service.upload_text(file_name=file_name, content=normalized_content)
+            db_service.update_document_status(s3_key, "uploaded")
+        except Exception:
+            db_service.update_document_status(s3_key, "failed")
+            raise
 
         return UploadTxtResponse(
             file_name=s3_service.build_object_name(file_name),

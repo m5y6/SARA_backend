@@ -47,7 +47,7 @@ class DatabaseService:
             query = """
                 SELECT
                     v.id as id,
-                    v.contenido as contenido_texto,
+                    COALESCE(v.contenido_texto, v.contenido) as contenido_texto,
                     COALESCE(v.metadata->>'titulo', v.metadata->>'source') as titulo,
                     (1 - (v.embedding <=> %s::vector)) as similarity
                 FROM fragmentos_vectores v
@@ -189,6 +189,90 @@ class DatabaseService:
             if conn:
                 conn.close()
 
+    def create_document_record(
+        self,
+        titulo: str,
+        ruta_s3: str,
+        subido_por: Optional[int] = None,
+        estado: Optional[str] = "uploaded",
+    ) -> int:
+        if not titulo or not titulo.strip():
+            raise ValueError("Document title cannot be empty")
+        if not ruta_s3 or not ruta_s3.strip():
+            raise ValueError("S3 path cannot be empty")
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO documentos_oficiales (titulo, ruta_s3, subido_por, estado)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (titulo.strip(), ruta_s3.strip(), subido_por, estado),
+            )
+            document_id = cursor.fetchone()[0]
+            conn.commit()
+            return document_id
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to create document record: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def update_document_status(self, ruta_s3: str, estado: str) -> None:
+        if not ruta_s3 or not ruta_s3.strip():
+            raise ValueError("S3 path cannot be empty")
+        if not estado or not estado.strip():
+            raise ValueError("Status cannot be empty")
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE documentos_oficiales
+                SET estado = %s, fecha_actualizacion = CURRENT_TIMESTAMP
+                WHERE ruta_s3 = %s
+                """,
+                (estado.strip(), ruta_s3.strip()),
+            )
+            conn.commit()
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to update document status: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _get_fragment_document_column(self, cursor) -> Optional[str]:
+        candidate_columns = [
+            "documento_id",
+            "document_id",
+            "id_documento",
+            "doc_id",
+            "documento_oficial_id",
+        ]
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'fragmentos_vectores'
+            """
+        )
+        existing_columns = {row[0] for row in cursor.fetchall()}
+        for column_name in candidate_columns:
+            if column_name in existing_columns:
+                return column_name
+        return None
+
     def delete_document_by_s3_key(self, s3_key: str) -> int:
         if not s3_key or not s3_key.strip():
             raise ValueError("S3 key cannot be empty")
@@ -197,6 +281,17 @@ class DatabaseService:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
+            fragment_column = self._get_fragment_document_column(cursor)
+            if fragment_column:
+                cursor.execute(
+                    f"""
+                    DELETE FROM fragmentos_vectores
+                    WHERE {fragment_column} IN (
+                        SELECT id FROM documentos_oficiales WHERE ruta_s3 = %s
+                    )
+                    """,
+                    (s3_key.strip(),),
+                )
             cursor.execute("DELETE FROM documentos_oficiales WHERE ruta_s3 = %s", (s3_key.strip(),))
             deleted_count = cursor.rowcount
             conn.commit()

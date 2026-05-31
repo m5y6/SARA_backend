@@ -88,6 +88,40 @@ DDL = [
 ]
 
 
+MIGRATIONS = [
+    """
+    ALTER TABLE IF EXISTS fragmentos_vectores
+    ADD COLUMN IF NOT EXISTS documento_id INT
+    """,
+    """
+    ALTER TABLE IF EXISTS fragmentos_vectores
+    ADD COLUMN IF NOT EXISTS contenido_texto TEXT
+    """,
+    """
+    ALTER TABLE IF EXISTS fragmentos_vectores
+    ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb
+    """,
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM information_schema.table_constraints
+            WHERE table_schema = 'public'
+              AND table_name = 'fragmentos_vectores'
+              AND constraint_name = 'fragmentos_vectores_documento_id_fkey'
+        ) THEN
+            ALTER TABLE fragmentos_vectores
+            ADD CONSTRAINT fragmentos_vectores_documento_id_fkey
+            FOREIGN KEY (documento_id)
+            REFERENCES documentos_oficiales(id)
+            ON DELETE CASCADE;
+        END IF;
+    END $$;
+    """,
+]
+
+
 def run():
     logger.info("Connecting to DB: %s", settings.database_url)
     conn = None
@@ -103,6 +137,9 @@ def run():
         cur = conn.cursor()
         for stmt in DDL:
             logger.info("Executing statement...")
+            cur.execute(stmt)
+        for stmt in MIGRATIONS:
+            logger.info("Executing migration...")
             cur.execute(stmt)
         cur.close()
         logger.info("Database schema initialized successfully.")
