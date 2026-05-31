@@ -81,6 +81,31 @@ class UploadTxtResponse(BaseModel):
     normalized_length: int
 
 
+class DeleteDocumentRequest(BaseModel):
+    s3_key: Optional[str] = None
+    file_name: Optional[str] = None
+
+
+class DeleteDocumentResponse(BaseModel):
+    s3_key: str
+    s3_deleted: bool
+    rds_deleted: bool
+    message: str
+
+
+class DocumentInfo(BaseModel):
+    file_name: str
+    s3_key: str
+    size: int
+    last_modified: Optional[str] = None
+
+
+class ListDocumentsResponse(BaseModel):
+    bucket_name: str
+    prefix: str
+    documents: List[DocumentInfo]
+
+
 def _normalize_intent_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text.lower())
     normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
@@ -346,6 +371,73 @@ async def upload_document_to_s3(
     except Exception as e:
         logger.error(f"Document upload error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error uploading document file.")
+
+
+@router.delete("/documents", response_model=DeleteDocumentResponse)
+async def delete_document(
+    request: DeleteDocumentRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_permission('delete')),
+) -> DeleteDocumentResponse:
+    try:
+        s3_service = get_s3_storage_service()
+        db_service = get_database_service()
+
+        s3_key = request.s3_key.strip() if request.s3_key else None
+        if not s3_key and request.file_name:
+            s3_key = s3_service.build_object_key(request.file_name)
+
+        if not s3_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Provide s3_key or file_name to delete the document.",
+            )
+
+        s3_service.delete_object(s3_key)
+        deleted_count = db_service.delete_document_by_s3_key(s3_key)
+
+        return DeleteDocumentResponse(
+            s3_key=s3_key,
+            s3_deleted=True,
+            rds_deleted=deleted_count > 0,
+            message="Document deleted successfully." if deleted_count > 0 else "S3 object deleted, but no matching document was found in RDS.",
+        )
+    except HTTPException:
+        raise
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        logger.error(f"AWS credentials error during document delete: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AWS credentials are not configured for document deletion.",
+        )
+    except ValueError as e:
+        logger.error(f"Document delete validation error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid input: {str(e)}")
+    except Exception as e:
+        logger.error(f"Document delete error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error deleting document file.")
+
+
+@router.get("/documents", response_model=ListDocumentsResponse)
+async def list_documents(
+    current_user: Dict[str, Any] = Depends(require_admin_or_permission('upload')),
+) -> ListDocumentsResponse:
+    try:
+        s3_service = get_s3_storage_service()
+        documents = s3_service.list_objects()
+        return ListDocumentsResponse(
+            bucket_name=s3_service.bucket_name,
+            prefix=s3_service.prefix,
+            documents=[DocumentInfo(**document) for document in documents],
+        )
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        logger.error(f"AWS credentials error during document list: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AWS credentials are not configured for document listing.",
+        )
+    except Exception as e:
+        logger.error(f"Document list error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error listing document files.")
 
 
 # Admin models and endpoints

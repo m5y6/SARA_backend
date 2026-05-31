@@ -4,7 +4,7 @@ Uploads plain text using the filename provided by the frontend.
 """
 
 from pathlib import PurePosixPath
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import boto3
 
@@ -56,6 +56,37 @@ class S3StorageService:
             ContentType="text/plain; charset=utf-8",
         )
         return object_key
+
+    def delete_object(self, object_key: str) -> None:
+        if not object_key or not object_key.strip():
+            raise ValueError("Object key cannot be empty")
+
+        self.client.delete_object(Bucket=self.bucket_name, Key=object_key.strip())
+
+    def list_objects(self) -> List[Dict[str, Any]]:
+        paginator = self.client.get_paginator("list_objects_v2")
+        documents: List[Dict[str, Any]] = []
+
+        pagination_kwargs = {"Bucket": self.bucket_name}
+        if self.prefix:
+            pagination_kwargs["Prefix"] = f"{self.prefix}/"
+
+        for page in paginator.paginate(**pagination_kwargs):
+            for item in page.get("Contents", []):
+                key = item.get("Key", "")
+                if not key:
+                    continue
+
+                documents.append(
+                    {
+                        "file_name": PurePosixPath(key).name,
+                        "s3_key": key,
+                        "size": item.get("Size", 0),
+                        "last_modified": item.get("LastModified").isoformat() if item.get("LastModified") else None,
+                    }
+                )
+
+        return documents
 
 
 _s3_storage_service: S3StorageService = None

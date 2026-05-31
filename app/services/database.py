@@ -189,6 +189,26 @@ class DatabaseService:
             if conn:
                 conn.close()
 
+    def delete_document_by_s3_key(self, s3_key: str) -> int:
+        if not s3_key or not s3_key.strip():
+            raise ValueError("S3 key cannot be empty")
+
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM documentos_oficiales WHERE ruta_s3 = %s", (s3_key.strip(),))
+            deleted_count = cursor.rowcount
+            conn.commit()
+            return deleted_count
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to delete document: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
     def seed_roles(self, default_roles: Optional[List[Dict[str, str]]] = None) -> bool:
         """Ensure the `roles` table has the default roles.
 
@@ -398,10 +418,13 @@ class DatabaseService:
                 sql = f"UPDATE usuarios SET {', '.join(updates)} WHERE id = %s"
                 cursor.execute(sql, tuple(params))
 
-            # Handle role change via dedicated method which also audits
+            # Handle role change on the same transaction to avoid locking the same row twice.
             if role_id is not None:
-                # use update_user_role which writes an audit entry
-                self.update_user_role(user_id=user_id, role_id=role_id, performed_by=performed_by)
+                cursor.execute("UPDATE usuarios SET rol_id = %s WHERE id = %s", (role_id, user_id))
+                cursor.execute(
+                    "INSERT INTO role_audit_log (action, performed_by, target_user, role_id, details) VALUES (%s,%s,%s,%s,%s)",
+                    ("assign_role", performed_by, user_id, role_id, None),
+                )
 
             # audit update of user fields
             details = {
