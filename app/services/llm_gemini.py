@@ -4,6 +4,7 @@ Generates responses based on retrieved document fragments and user questions.
 """
 
 import google.generativeai as genai
+import re
 from typing import List, Dict, Any, Optional
 from app.core.config import settings
 
@@ -36,47 +37,145 @@ class GeminiService:
                 unique_candidates.append(candidate)
         return unique_candidates
 
-    def _build_system_prompt(self) -> str:
-        return """You are SARA (Sistema de Asistencia de Reglamentos Académicos), 
-an expert assistant for academic regulations.
+    def _build_system_prompt(self, has_fragments: bool = True) -> str:
+        if has_fragments:
+            return """You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
 
-CONSTRAINTS:
-1. Answer ONLY based on provided fragments.
-2. If not found, state: "No encontré información relevante sobre esta pregunta en los reglamentos académicos disponibles."
-3. Be concise and cite relevant sections.
-4. Use Spanish language.
+CRITICAL - You have relevant fragments from DUOC UC regulations:
+1. Answer ONLY based on the provided fragments
+2. Do not refuse or say "no relevante" - the fragments are related to the question
+3. Extract examples, lists, and resource names from fragments and include them directly
+4. Be concise and cite which fragment you're using
+5. Respond in Spanish"""
+        else:
+            return """You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
 
-Document Fragments:
-"""
+INSTRUCTIONS:
+1. No relevant regulation fragments were found in the database
+2. You can answer general questions about DUOC UC policies, but be cautious
+3. Suggest the user consult official DUOC UC documentation if unsure
+4. Always respond as an official DUOC UC support assistant
+5. Respond in Spanish"""
 
     def _build_user_prompt(self, question: str, fragments: List[Dict[str, Any]]) -> str:
-        prompt = self._build_system_prompt()
+        has_fragments = bool(fragments)
+        prompt = self._build_system_prompt(has_fragments=has_fragments)
+        
         if fragments:
+            prompt += "\n\nRELEVANT DOCUMENTS:\n"
             for i, fragment in enumerate(fragments, 1):
                 similarity = fragment.get("similarity", 0)
-                contenido = fragment.get("contenido", "")
-                prompt += f"\n[Fragment {i} - Relevance: {similarity:.2%}]\n{contenido}\n"
-        else:
-            prompt += "\n[No relevant fragments found]\n"
-        prompt += f"\n---\n\nUser Question: {question}\n\nAnswer:"
+                titulo = fragment.get("titulo") or f"Document {i}"
+                contenido = fragment.get("contenido_texto") or fragment.get("contenido", "")
+                prompt += f"\n[{titulo}] (Relevance: {similarity:.1%})\n{contenido}\n"
+        
+        prompt += f"\n---\nQUESTION: {question}"
         return prompt
 
     def _build_fallback_prompt(self, question: str) -> str:
-        return f"""You are SARA (Sistema de Asistencia de Reglamentos Académicos).
+        return f"""You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
 
-No relevant fragments were found in the vectorized academic regulations database for this question.
+    No relevant fragments were found in the vectorized academic regulations database for this question.
 
-Instructions:
-1. Answer in Spanish.
-2. If this is a greeting or small talk, reply naturally and briefly.
-3. If this is an academic, institutional, or regulatory question, do not answer it from general knowledge.
-4. In that case, say that no relevant information was found in the vectorized academic regulations available.
-5. Do not invent specific regulations, articles, institutional rules, or answers you are not certain about.
-6. Keep the response short and avoid adding unsupported details.
+    Instructions:
+    1. Answer in Spanish.
+    2. Respond naturally and helpfully, like a support assistant for DUOC UC.
+    3. Do not mention internal retrieval errors or technical limitations.
+    4. If the question is about academic or institutional rules, give the best general guidance you can without inventing specific regulations.
+    5. If you are unsure about an exact policy, say it should be verified in the official DUOC UC documents.
+    6. Keep the response concise and friendly.
 
-User Question: {question}
+    User Question: {question}
 
-Answer:"""
+    Answer:"""
+
+    @staticmethod
+    def _is_refusal_answer(answer: str) -> bool:
+        normalized = (answer or "").lower()
+        refusal_markers = (
+            "no encontré",
+            "no encontre",
+            "no contiene información relevante",
+            "no contiene informacion relevante",
+            "lo siento",
+            "te sugiero revisar el documento oficial",
+            "no relevant",
+        )
+        return any(marker in normalized for marker in refusal_markers)
+
+    @staticmethod
+    def _normalize_question_keywords(question: str) -> List[str]:
+        normalized = re.sub(r"[^a-z0-9áéíóúüñ\s]", " ", (question or "").lower())
+        stopwords = {
+            "que",
+            "tipo",
+            "cuál",
+            "cual",
+            "puedo",
+            "debo",
+            "usar",
+            "usaré",
+            "puedo",
+            "sobre",
+            "para",
+            "una",
+            "un",
+            "el",
+            "la",
+            "los",
+            "las",
+            "en",
+            "y",
+            "o",
+            "me",
+            "mi",
+            "tu",
+            "se",
+            "ocupar",
+            "utilizar",
+            "usar",
+            "presentacion",
+            "presentación",
+        }
+        return [token for token in normalized.split() if len(token) > 3 and token not in stopwords]
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9áéíóúüñ\s]", " ", (text or "").lower())
+
+    def _synthesize_fragment_answer(self, question: str, fragments: List[Dict[str, Any]]) -> str:
+        question_keywords = set(self._normalize_question_keywords(question))
+        
+        best_sentences = []
+        
+        for fragment in fragments:
+            titulo = fragment.get("titulo") or "fragmento"
+            contenido = fragment.get("contenido_texto") or fragment.get("contenido", "")
+            contenido = contenido.strip() if contenido else ""
+            if not contenido:
+                continue
+            
+            lines = contenido.split("\n")
+            for line in lines:
+                clean = line.replace("●", "").strip()
+                if len(clean) < 30:
+                    continue
+                
+                line_norm = self._normalize_text(clean)
+                keyword_matches = sum(1 for kw in question_keywords if kw in line_norm)
+                
+                if keyword_matches > 0:
+                    best_sentences.append((keyword_matches, len(clean), titulo, clean))
+        
+        if best_sentences:
+            best_sentences.sort(key=lambda x: (-x[0], -x[1]))
+            selected = best_sentences[:2]
+            lines = ["De acuerdo a los reglamentos académicos:"]
+            for _, _, titulo, sentence in selected:
+                lines.append(f"• {sentence[:250]}")
+            return "\n".join(lines)
+        
+        return "No encontré información suficiente en los fragmentos recuperados para responder con precisión."
 
     def generate_response(
         self,
@@ -128,6 +227,7 @@ Answer:"""
         fragments: List[Dict[str, Any]],
         temperature: float = 0.3
     ) -> Dict[str, Any]:
+        """Generate response with or without fragments - let Gemini handle both cases."""
         answer = self.generate_response(question=question, fragments=fragments, temperature=temperature)
         return {
             "answer": answer,

@@ -46,8 +46,8 @@ class DatabaseService:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             query = """
                 SELECT
-                    v.id as id,
-                    COALESCE(v.contenido_texto, v.contenido) as contenido_texto,
+                    v.documento_id as id,
+                    v.contenido_texto as contenido_texto,
                     COALESCE(v.metadata->>'titulo', v.metadata->>'source') as titulo,
                     (1 - (v.embedding <=> %s::vector)) as similarity
                 FROM fragmentos_vectores v

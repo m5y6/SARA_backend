@@ -7,12 +7,12 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form, status, De
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import re
-import unicodedata
 import time
 from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from app.services.embedding import get_embedding_service
 from app.services.database import get_database_service
 from app.services.llm_gemini import get_gemini_service
+from app.core.config import settings
 from app.services.text_normalization import normalize_text, prepare_document_text, extract_uploaded_document_text
 from app.services.s3_storage import get_s3_storage_service
 from app.services.auth import authenticate_user, create_access_token, get_current_user, require_admin, require_permission, require_admin_or_permission
@@ -106,72 +106,20 @@ class ListDocumentsResponse(BaseModel):
     documents: List[DocumentInfo]
 
 
-def _normalize_intent_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text.lower())
-    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    normalized = re.sub(r"[^a-z0-9\s?¿!¡]", " ", normalized)
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized.strip()
+def _get_session_id_for_request(
+    db_service,
+    request: QuestionRequest,
+    current_user: Dict[str, Any],
+) -> int:
+    if request.sesion_id:
+        session_owner = db_service.get_session_owner(request.sesion_id)
+        if session_owner is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        if int(session_owner) != int(current_user["user_id"]):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to current user")
+        return request.sesion_id
 
-
-def _is_greeting_or_identity_message(text: str) -> bool:
-    normalized = _normalize_intent_text(text)
-    if not normalized:
-        return False
-
-    academic_markers = (
-        "reglamento",
-        "reglamentos",
-        "articulo",
-        "artículos",
-        "articulo",
-        "alumno",
-        "alumna",
-        "inasistencia",
-        "inasistencias",
-        "semestre",
-        "nota",
-        "evaluacion",
-        "evaluación",
-        "malla",
-        "carrera",
-        "examen",
-        "calificacion",
-        "calificación",
-        "titulo",
-        "título",
-    )
-    if any(marker in normalized for marker in academic_markers):
-        return False
-
-    greeting_patterns = (
-        r"^(hola+|buenas|buenos dias|buenas tardes|buenas noches|saludos)\b",
-        r"^(que tal|que onda|holi|hey|hi)\b",
-    )
-    identity_patterns = (
-        r"\b(eres|estas|sos) gemini\b",
-        r"\bquien eres\b",
-        r"\bque eres\b",
-        r"\beres una ia\b",
-        r"\beres inteligencia artificial\b",
-    )
-
-    return any(re.search(pattern, normalized) for pattern in greeting_patterns + identity_patterns)
-
-
-def _build_direct_chat_response(question: str) -> Dict[str, Any]:
-    normalized = _normalize_intent_text(question)
-    if re.search(r"\b(eres|estas|sos) gemini\b|\bquien eres\b|\bque eres\b|\beres una ia\b", normalized):
-        answer = "No, soy SARA. Puedo ayudarte con reglamentos académicos y consultas basadas en documentos."
-    else:
-        answer = "Hola, soy SARA. Puedo ayudarte con reglamentos académicos y consultas basadas en documentos."
-
-    return {
-        "answer": answer,
-        "fragments_used": 0,
-        "fragments": [],
-        "model": "rule-based",
-    }
+    return db_service.create_session(int(current_user["user_id"]))
 
 
 @router.post("/auth/login", response_model=LoginResponse)
@@ -207,85 +155,104 @@ async def ask_question(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> QuestionResponse:
     try:
-        if _is_greeting_or_identity_message(request.question):
-            response_data = _build_direct_chat_response(request.question)
-            db_service = get_database_service()
-            tiempo_ms = 0
+        db_service = get_database_service()
 
-            if request.sesion_id:
-                session_owner = db_service.get_session_owner(request.sesion_id)
-                if session_owner is None:
-                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-                if int(session_owner) != int(current_user["user_id"]):
-                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to current user")
-                sesion_id = request.sesion_id
-            else:
-                sesion_id = db_service.create_session(int(current_user["user_id"]))
+        logger.info(
+            "ASK request received | user_id=%s | question=%s",
+            current_user.get("user_id"),
+            request.question[:120],
+        )
 
+        logger.info(f"Generating embedding for question: {request.question[:50]}...")
+        embedding_service = get_embedding_service()
+        try:
+            question_embedding = embedding_service.embed_text(request.question)
+            logger.info(
+                "ASK retrieval embedding | model=%s | dim=%s | vector_length=%s",
+                settings.embedding_model,
+                settings.embedding_dim,
+                len(question_embedding),
+            )
+        except RuntimeError as e:
+            logger.error(f"Embedding service unavailable: {str(e)}")
+            question_embedding = None
+
+        gemini_service = get_gemini_service()
+        start_ts = time.time()
+        
+        fragments = []
+        if question_embedding is not None:
+            logger.info("Searching for similar fragments...")
+            try:
+                fragments = db_service.search_similar_fragments(question_embedding)
+            except Exception as e:
+                logger.error(f"Fragment search failed: {str(e)}")
+                fragments = []
+        
+        if not fragments:
+            logger.warning(f"No fragments found")
+            logger.info("ASK mode: FALLBACK | vectorized fragments passed: 0 | only user question sent to Gemini")
+            try:
+                response_data = gemini_service.generate_fallback_response(
+                    question=request.question,
+                    temperature=request.temperature,
+                )
+            except Exception as e:
+                logger.error(f"Gemini fallback generation failed: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="AI response service is unavailable right now",
+                )
+        else:
+            logger.info(f"Found {len(fragments)} fragments")
+            fragment_ids = [f.get("id") for f in fragments]
+            fragment_titles = [f.get("titulo") for f in fragments]
+            logger.info(
+                "ASK mode: RAG | vectorized fragments passed: %s | fragment_ids=%s",
+                len(fragments),
+                fragment_ids,
+            )
+            logger.info("ASK fragments titles: %s", fragment_titles)
+            logger.info(
+                "ASK fragments preview: %s",
+                [
+                    (f.get("titulo"), (f.get("contenido_texto") or f.get("contenido") or "")[:180])
+                    for f in fragments
+                ],
+            )
+            logger.info("Generating response...")
+            try:
+                response_data = gemini_service.generate_rag_response(
+                    question=request.question,
+                    fragments=fragments,
+                    temperature=request.temperature
+                )
+            except Exception as e:
+                logger.error(f"Gemini response generation failed: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="AI response service is unavailable right now",
+                )
+        tiempo_ms = int((time.time() - start_ts) * 1000)
+
+        sesion_id = _get_session_id_for_request(db_service, request, current_user)
+
+        vector_ids = [f["id"] for f in fragments]
+        try:
             db_service.save_chat_transaction(
                 sesion_id=sesion_id,
                 pregunta=request.question,
                 respuesta=response_data["answer"],
-                vector_ids=[],
+                vector_ids=vector_ids,
                 tiempo_ms=tiempo_ms,
             )
-
-            return QuestionResponse(
-                answer=response_data["answer"],
-                fragments_used=0,
-                fragments=[],
-                model=response_data["model"],
-            )
-
-        logger.info(f"Generating embedding for question: {request.question[:50]}...")
-        embedding_service = get_embedding_service()
-        question_embedding = embedding_service.embed_text(request.question)
-        gemini_service = get_gemini_service()
-        start_ts = time.time()
-        
-        logger.info("Searching for similar fragments...")
-        db_service = get_database_service()
-        fragments = db_service.search_similar_fragments(question_embedding)
-        
-        if not fragments:
-            logger.warning(f"No fragments found")
-            response_data = gemini_service.generate_fallback_response(
-                question=request.question,
-                temperature=request.temperature,
-            )
-        else:
-            logger.info(f"Found {len(fragments)} fragments")
-            logger.info("Generating response...")
-            response_data = gemini_service.generate_rag_response(
-                question=request.question,
-                fragments=fragments,
-                temperature=request.temperature
-            )
-        tiempo_ms = int((time.time() - start_ts) * 1000)
-
-        if request.sesion_id:
-            session_owner = db_service.get_session_owner(request.sesion_id)
-            if session_owner is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-            if int(session_owner) != int(current_user["user_id"]):
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to current user")
-            sesion_id = request.sesion_id
-        else:
-            sesion_id = db_service.create_session(int(current_user["user_id"]))
-
-        vector_ids = [f["id"] for f in fragments]
-        db_service.save_chat_transaction(
-            sesion_id=sesion_id,
-            pregunta=request.question,
-            respuesta=response_data["answer"],
-            vector_ids=vector_ids,
-            tiempo_ms=tiempo_ms,
-        )
+        except Exception as e:
+            logger.warning(f"Failed to save chat transaction: {str(e)}")
         
         formatted_fragments = [
             FragmentInfo(
                 id=f["id"],
-                contenido=f.get("contenido_texto") or f.get("contenido"),
+                contenido=(f.get("contenido_texto") or f.get("contenido") or ""),
                 metadata={"titulo": f.get("titulo")},
                 similarity=f["similarity"]
             )
@@ -303,6 +270,8 @@ async def ask_question(
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid input: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing question: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error processing your question.")
