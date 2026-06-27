@@ -185,11 +185,6 @@ async def ask_question(
             logger.info("Searching for similar fragments...")
             try:
                 fragments = db_service.search_similar_fragments(question_embedding)
-                # Filter fragments by configured similarity threshold to avoid weak matches
-                filtered = [f for f in (fragments or []) if f.get("similarity", 0) >= settings.similarity_threshold]
-                if len(filtered) != len(fragments or []):
-                    logger.info("Filtered weak fragments: original=%s filtered=%s", len(fragments or []), len(filtered))
-                fragments = filtered
             except Exception as e:
                 logger.error(f"Fragment search failed: {str(e)}")
                 fragments = []

@@ -36,28 +36,41 @@ class DatabaseService:
         threshold: float = None
     ) -> List[Dict[str, Any]]:
         top_k = top_k or settings.top_k_fragments
-        threshold = threshold or settings.similarity_threshold
+        similarity_threshold = threshold or settings.similarity_threshold
+        distance_threshold = 1 - similarity_threshold
+
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        logging.info(f"DATABASE SEARCH: similarity_threshold={similarity_threshold}, distance_threshold={distance_threshold}")
+
         if not query_embedding:
             raise ValueError("Query embedding cannot be empty")
-        
+
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
             query = """
                 SELECT
                     v.documento_id as id,
                     v.contenido_texto as contenido_texto,
                     COALESCE(v.metadata->>'titulo', v.metadata->>'source') as titulo,
-                    (1 - (v.embedding <=> %s::vector)) as similarity
+                    (1 - (v.embedding <=> %(embedding)s::vector)) as similarity
                 FROM fragmentos_vectores v
-                WHERE (1 - (v.embedding <=> %s::vector)) >= %s
-                ORDER BY v.embedding <=> %s::vector
-                LIMIT %s
+                WHERE v.embedding <=> %(embedding)s::vector <= %(distance_threshold)s
+                ORDER BY v.embedding <=> %(embedding)s::vector
+                LIMIT %(top_k)s
             """
 
             embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
-            cursor.execute(query, (embedding_str, embedding_str, threshold, embedding_str, top_k))
+            params = {
+                "embedding": embedding_str,
+                "distance_threshold": distance_threshold,
+                "top_k": top_k
+            }
+            
+            cursor.execute(query, params)
             results = cursor.fetchall()
 
             formatted_results = [

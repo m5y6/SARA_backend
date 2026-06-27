@@ -85,6 +85,11 @@ DDL = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_embedding_cosine
+    ON fragmentos_vectores
+    USING hnsw (embedding vector_cosine_ops);
+    """
 ]
 
 
