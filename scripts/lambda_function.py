@@ -13,11 +13,20 @@ import pg8000.native
 sys.path.append('/opt/python')
 from fastembed import TextEmbedding
 
-
+# --- Configuration ---
+# The S3 bucket where the model zip file is stored.
 BUCKET_NAME = "sara-repository-duoc"
-MODEL_ZIP_KEY = "modelo_sara (1).zip"
+# The name of the multilingual model being used.
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+# The S3 key (filename) of the zip file containing the model.
+# IMPORTANT: The user must create this zip file and upload it to the S3 bucket.
+MODEL_S3_KEY = "paraphrase-multilingual-mpnet-base-v2.zip"
+# A temporary directory within the Lambda environment for caching model files.
 TMP_BASE = "/tmp/fastembed_cache"
+# The expected local path where the model files will be placed.
+MODEL_LOCAL_PATH = os.path.join(TMP_BASE, MODEL_NAME)
 
+# Global variable to hold the initialized embedding model.
 embedding_model = None
 
 
@@ -62,56 +71,70 @@ def prepare_document_text(text: str) -> str:
 
 
 def ensure_model_is_ready():
+    """
+    Ensures the embedding model is initialized from a local S3 download.
+    This avoids the need for internet access in the Lambda environment.
+    """
     global embedding_model
     if embedding_model is not None:
         return
 
-    flat_path = os.path.join(TMP_BASE, "bge-small-en-v1.5")
-
-    if not os.path.exists(flat_path):
-        print("LOG: Instalando cerebro desde S3...")
-        os.makedirs(TMP_BASE, exist_ok=True)
+    # Check if model files are already available locally in the /tmp directory.
+    # We check for a common model file like 'model.onnx'.
+    if not os.path.exists(os.path.join(MODEL_LOCAL_PATH, "model.onnx")):
+        print(f"LOG: Model not found locally. Attempting to download from S3 (s3://{BUCKET_NAME}/{MODEL_S3_KEY}).")
+        os.makedirs(MODEL_LOCAL_PATH, exist_ok=True)
         s3 = boto3.client("s3")
-        local_zip = "/tmp/temp_model.zip"
+        local_zip_path = f"/tmp/{MODEL_S3_KEY}"
 
-        s3.download_file(BUCKET_NAME, MODEL_ZIP_KEY, local_zip)
-        extract_path = "/tmp/extrayendo"
-        with zipfile.ZipFile(local_zip, "r") as zip_ref:
+        try:
+            s3.download_file(BUCKET_NAME, MODEL_S3_KEY, local_zip_path)
+            print("LOG: Model zip file downloaded successfully from S3.")
+        except Exception as e:
+            print(f"FATAL: Failed to download model from S3 bucket '{BUCKET_NAME}' with key '{MODEL_S3_KEY}'. Please ensure the file exists and the Lambda has S3 permissions. Error: {e}")
+            raise
+
+        # Unzip the model files.
+        extract_path = "/tmp/extracting_model"
+        print(f"LOG: Unzipping model from {local_zip_path} to {extract_path}...")
+        with zipfile.ZipFile(local_zip_path, "r") as zip_ref:
             zip_ref.extractall(extract_path)
-        os.remove(local_zip)
+        os.remove(local_zip_path)
+        print("LOG: Unzip complete.")
 
-        onnx_folder = None
+        # The actual model files might be nested in a subdirectory inside the zip.
+        # We walk the extracted path to find the directory containing 'model.onnx'.
+        onnx_folder = extract_path
         for root, dirs, files in os.walk(extract_path):
-            if any(f.endswith(".onnx") for f in files):
+            if "model.onnx" in files:
                 onnx_folder = root
                 break
+        
+        print(f"LOG: Found model files in '{onnx_folder}'. Moving them to final destination: '{MODEL_LOCAL_PATH}'")
+        # Move all files from the found folder to the target cache directory.
+        for item in os.listdir(onnx_folder):
+            shutil.move(os.path.join(onnx_folder, item), os.path.join(MODEL_LOCAL_PATH, item))
+        shutil.rmtree(extract_path)
 
-        if onnx_folder:
-            print(f"LOG: Modelo encontrado en {onnx_folder}. Aplanando a {flat_path}...")
-            os.makedirs(flat_path, exist_ok=True)
-            for item in os.listdir(onnx_folder):
-                shutil.move(os.path.join(onnx_folder, item), os.path.join(flat_path, item))
-            shutil.rmtree(extract_path)
-        else:
-            raise Exception("No se encontró ningún archivo .onnx en el ZIP de S3.")
-
-    print("LOG: Inicializando motor de IA local...")
+    print("LOG: Initializing embedding model from local files...")
     embedding_model = TextEmbedding(
-        model_name="BAAI/bge-small-en-v1.5",
+        model_name=MODEL_NAME,
         cache_dir=TMP_BASE,
-        local_files_only=True,
+        local_files_only=True,  # This is CRITICAL to prevent internet access attempts.
     )
+    print("LOG: Model initialized successfully.")
 
 
-def get_embedding_local(text):
+def get_embedding_local(text: str) -> list[float] | None:
     try:
         ensure_model_is_ready()
         embeddings_generator = embedding_model.embed([text])
         vector = list(next(embeddings_generator))
         return [float(v) for v in vector]
     except Exception as e:
-        print(f"Error en vectorización local: {e}")
-        return None
+        print(f"Error during local vectorization: {e}")
+        # Re-raise the exception to make the Lambda fail and retry, which might resolve transient issues.
+        raise
 
 
 def ensure_document_record(conn, key: str):
@@ -124,7 +147,7 @@ def ensure_document_record(conn, key: str):
         return doc_row[0][0]
 
     titulo = os.path.basename(key)
-    print(f"LOG: No existe documento_oficiales para ruta_s3={key}. Creando registro...")
+    print(f"LOG: No 'documentos_oficiales' record for ruta_s3={key}. Creating one...")
     inserted = conn.run(
         """
         INSERT INTO documentos_oficiales (titulo, ruta_s3, estado)
@@ -152,30 +175,32 @@ def update_document_status(conn, document_id: int, estado: str):
 
 
 def lambda_handler(event, context):
-    print("LOG: Iniciando SARA Procesador")
+    print("LOG: SARA Processor starting...")
 
-    bucket = event["Records"][0]["s3"]["bucket"]["name"]
-    raw_key = event["Records"][0]["s3"]["object"]["key"]
-    key = urllib.parse.unquote_plus(raw_key)
-
-    if key.endswith(".zip"):
-        return {"status": "skipped"}
-
-    s3_client = boto3.client("s3")
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    file_content = response["Body"].read().decode("utf-8-sig")
-
-    texto_limpio = prepare_document_text(file_content)
-    chunks = [texto_limpio[i:i + 1000] for i in range(0, len(texto_limpio), 800)]
-    print(f"Procesando {len(chunks)} fragmentos de {key}")
-
-    conn = None
-    documento_id = None
     try:
+        bucket = event["Records"][0]["s3"]["bucket"]["name"]
+        raw_key = event["Records"][0]["s3"]["object"]["key"]
+        key = urllib.parse.unquote_plus(raw_key)
+
+        if key.endswith(".zip"):
+            print(f"LOG: Skipping file '{key}' as it appears to be a zip archive.")
+            return {"status": "skipped"}
+
+        s3_client = boto3.client("s3")
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        file_content = response["Body"].read().decode("utf-8-sig")
+
+        texto_limpio = prepare_document_text(file_content)
+        chunks = [texto_limpio[i : i + 1000] for i in range(0, len(texto_limpio), 800)]
+        print(f"Processing {len(chunks)} fragments from '{key}'")
+
+        conn = None
+        documento_id = None
+        
         conn = pg8000.native.Connection(
-            user="postgres",
+            user=os.environ.get("db_user", "postgres"),
             host=os.environ["bd"],
-            database="sara_db",
+            database=os.environ.get("db_name", "sara_db"),
             password=os.environ["db_password"],
         )
 
@@ -184,41 +209,36 @@ def lambda_handler(event, context):
         for chunk in chunks:
             vector = get_embedding_local(chunk)
             if vector:
-                print("DEBUG: Insertando vector (384 dimensiones)")
+                print("DEBUG: Inserting vector (768 dimensions)")
                 sql = """
                 INSERT INTO fragmentos_vectores
                 (documento_id, contenido_texto, embedding, metadata)
                 VALUES (:documento_id, :contenido_texto, :embedding, :metadata)
                 """
-
                 conn.run(
                     sql,
                     documento_id=documento_id,
                     contenido_texto=chunk,
                     embedding=str(vector),
-                    metadata=json.dumps(
-                        {
-                            "source": key,
-                            "titulo": os.path.basename(key),
-                        }
-                    ),
+                    metadata=json.dumps({"source": key, "titulo": os.path.basename(key)}),
                 )
 
         if documento_id is not None:
             update_document_status(conn, documento_id, "vectorized")
 
-        print("LOG: ¡SARA COMPLETADA! Todos los vectores guardados.")
+        print("LOG: SARA processing complete! All vectors saved.")
         return {"status": "success", "file": key}
 
     except Exception as e:
-        print(f"ERROR: {e}")
-        if conn and documento_id is not None:
+        print(f"FATAL ERROR in lambda_handler: {e}")
+        # Attempt to mark the document as failed if we got far enough to have a DB connection and document ID.
+        if 'conn' in locals() and conn and 'documento_id' in locals() and documento_id:
             try:
                 update_document_status(conn, documento_id, "failed")
             except Exception as status_error:
-                print(f"ERROR actualizando estado del documento: {status_error}")
+                print(f"ERROR: Could not update document status to 'failed'.Nested error: {status_error}")
         raise
 
     finally:
-        if conn:
+        if 'conn' in locals() and conn:
             conn.close()

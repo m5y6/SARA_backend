@@ -46,7 +46,7 @@ DDL = [
         id SERIAL PRIMARY KEY,
         documento_id INT REFERENCES documentos_oficiales(id) ON DELETE CASCADE,
         contenido_texto TEXT NOT NULL,
-        embedding vector(384),
+        embedding vector(768),
         numero_pagina INT
     );
     """,

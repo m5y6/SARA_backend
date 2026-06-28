@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     debug: bool = False
     frontend_url: str = "http://localhost:3000"
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
-    embedding_dim: int = 384
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    embedding_dim: int = 768
     llm_model: str = "gemini-2.5-flash"
     max_tokens: int = 2048
     top_k_fragments: int = 3
