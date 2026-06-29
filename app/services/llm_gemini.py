@@ -1,45 +1,26 @@
 """
-LLM service using Google Gemini API.
+LLM service using Google GenAI SDK.
 Generates responses based on retrieved document fragments and user questions.
 """
 
-import google.generativeai as genai
-import re
+from google import genai
 from typing import List, Dict, Any, Optional
 from app.core.config import settings
-
+from google.genai import types
 
 class GeminiService:
-    """Service for interacting with Google Gemini API."""
+    """Service for interacting with Google GenAI SDK."""
 
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or settings.gemini_api_key
-        self.model_name = settings.llm_model
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel(self.model_name)
+    def __init__(self):
+        try:
+            self.client = genai.Client(api_key=settings.gemini_api_key)
+        except Exception as e:
+            raise ValueError("Failed to initialize Gemini client. Is GEMINI_API_KEY set?") from e
+        self.model_name = f"models/{settings.llm_model}"
 
-    def _get_fallback_model_names(self) -> List[str]:
-        candidates = [
-            self.model_name,
-            "gemini-2.5-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-2.0-flash-001",
-            "gemini-2.0-flash",
-            "gemini-flash-latest",
-            "gemini-1.5-flash-002",
-            "gemini-1.5-pro",
-        ]
-        seen = set()
-        unique_candidates = []
-        for candidate in candidates:
-            if candidate and candidate not in seen:
-                seen.add(candidate)
-                unique_candidates.append(candidate)
-        return unique_candidates
-
-    def _build_system_prompt(self, has_fragments: bool = True) -> str:
+    def _build_system_prompt(self, has_fragments: bool = True, has_history: bool = False) -> str:
         if has_fragments:
-            return """You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
+            base_prompt = """You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
 
 You have been provided with one or more fragments from DUOC UC's academic regulations to help you answer the user's question.
 
@@ -51,7 +32,7 @@ Your task is to generate a helpful and accurate response by following these inst
 4.  **Language**: Always respond in Spanish.
 """
         else:
-            return """You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
+            base_prompt = """You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
 
 INSTRUCTIONS:
 1. No relevant regulation fragments were found in the database
@@ -60,178 +41,93 @@ INSTRUCTIONS:
 4. Always respond as an official DUOC UC support assistant
 5. Respond in Spanish"""
 
-    def _build_user_prompt(self, question: str, fragments: List[Dict[str, Any]]) -> str:
+        if has_history:
+            base_prompt += """
+6. **Contextual Awareness**: You have been provided with the recent history of the conversation. Use this history to understand the context of the user's current question, especially if it is short or ambiguous (e.g., 'and for grades?'). Avoid repeating greetings if a conversation is already in progress."""
+        return base_prompt
+
+    def _build_user_prompt(self, question: str, fragments: List[Dict[str, Any]], chat_history: Optional[str] = None) -> str:
         has_fragments = bool(fragments)
-        prompt = self._build_system_prompt(has_fragments=has_fragments)
-        
+        has_history = bool(chat_history)
+        prompt = self._build_system_prompt(has_fragments=has_fragments, has_history=has_history)
+
+        if chat_history:
+            prompt += f"""
+
+CONVERSATION HISTORY:
+{chat_history}"""
+
         if fragments:
-            prompt += "\n\nRELEVANT DOCUMENTS:\n"
+            prompt += """
+
+RELEVANT DOCUMENTS:
+"""
             for i, fragment in enumerate(fragments, 1):
                 similarity = fragment.get("similarity", 0)
                 titulo = fragment.get("titulo") or f"Document {i}"
                 contenido = fragment.get("contenido_texto") or fragment.get("contenido", "")
-                prompt += f"\n[{titulo}] (Relevance: {similarity:.1%})\n{contenido}\n"
+                prompt += f"""
+[{titulo}] (Relevance: {similarity:.1%})
+{contenido}
+"""
         
-        prompt += f"\n---\nQUESTION: {question}"
+        prompt += f"""
+---
+CURRENT QUESTION: {question}"""
         return prompt
-
-    def _build_fallback_prompt(self, question: str) -> str:
-        return f"""You are SARA (Sistema de Asistencia de Reglamentos Académicos), an AI support assistant for DUOC UC.
-
-    No relevant fragments were found in the vectorized academic regulations database for this question.
-
-    Instructions:
-    1. Answer in Spanish.
-    2. Respond naturally and helpfully, like a support assistant for DUOC UC.
-    3. Do not mention internal retrieval errors or technical limitations.
-    4. If the question is about academic or institutional rules, give the best general guidance you can without inventing specific regulations.
-    5. If you are unsure about an exact policy, say it should be verified in the official DUOC UC documents.
-    6. Keep the response concise and friendly.
-
-    User Question: {question}
-
-    Answer:"""
-
-    @staticmethod
-    def _is_refusal_answer(answer: str) -> bool:
-        normalized = (answer or "").lower()
-        refusal_markers = (
-            "no encontré",
-            "no encontre",
-            "no contiene información relevante",
-            "no contiene informacion relevante",
-            "lo siento",
-            "te sugiero revisar el documento oficial",
-            "no relevant",
+    
+    def _call_gemini_sdk(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        config_obj = types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature
         )
-        return any(marker in normalized for marker in refusal_markers)
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=config_obj
+            )
+            try:
+                return response.text
+            except ValueError:
+                # If the response doesn't contain text, check if the prompt was blocked.
+                if response.prompt_feedback.block_reason:
+                     raise ValueError(f"Request was blocked by the API: {response.prompt_feedback.block_reason.name}")
+                else:
+                    raise ValueError("Empty response from Gemini API and no block reason.")
 
-    @staticmethod
-    def _normalize_question_keywords(question: str) -> List[str]:
-        normalized = re.sub(r"[^a-z0-9áéíóúüñ\s]", " ", (question or "").lower())
-        stopwords = {
-            "que",
-            "tipo",
-            "cuál",
-            "cual",
-            "puedo",
-            "debo",
-            "usar",
-            "usaré",
-            "puedo",
-            "sobre",
-            "para",
-            "una",
-            "un",
-            "el",
-            "la",
-            "los",
-            "las",
-            "en",
-            "y",
-            "o",
-            "me",
-            "mi",
-            "tu",
-            "se",
-            "ocupar",
-            "utilizar",
-            "usar",
-            "presentacion",
-            "presentación",
-        }
-        return [token for token in normalized.split() if len(token) > 3 and token not in stopwords]
-
-    @staticmethod
-    def _normalize_text(text: str) -> str:
-        return re.sub(r"[^a-z0-9áéíóúüñ\s]", " ", (text or "").lower())
-
-    def _synthesize_fragment_answer(self, question: str, fragments: List[Dict[str, Any]]) -> str:
-        question_keywords = set(self._normalize_question_keywords(question))
-        
-        best_sentences = []
-        
-        for fragment in fragments:
-            titulo = fragment.get("titulo") or "fragmento"
-            contenido = fragment.get("contenido_texto") or fragment.get("contenido", "")
-            contenido = contenido.strip() if contenido else ""
-            if not contenido:
-                continue
-            
-            lines = contenido.split("\n")
-            for line in lines:
-                clean = line.replace("●", "").strip()
-                if len(clean) < 30:
-                    continue
-                
-                line_norm = self._normalize_text(clean)
-                keyword_matches = sum(1 for kw in question_keywords if kw in line_norm)
-                
-                if keyword_matches > 0:
-                    best_sentences.append((keyword_matches, len(clean), titulo, clean))
-        
-        if best_sentences:
-            best_sentences.sort(key=lambda x: (-x[0], -x[1]))
-            selected = best_sentences[:2]
-            lines = ["De acuerdo a los reglamentos académicos:"]
-            for _, _, titulo, sentence in selected:
-                lines.append(f"• {sentence[:250]}")
-            return "\n".join(lines)
-        
-        return "No encontré información suficiente en los fragmentos recuperados para responder con precisión."
+        except Exception as e:
+            raise Exception(f"Google GenAI SDK call failed: {str(e)}") from e
 
     def generate_response(
         self,
         question: str,
         fragments: List[Dict[str, Any]],
+        chat_history: Optional[str] = None,
         temperature: float = 0.3,
         max_tokens: Optional[int] = None
     ) -> str:
         if not question or not question.strip():
             raise ValueError("Question cannot be empty")
         max_tokens = max_tokens or settings.max_tokens
-        user_prompt = self._build_user_prompt(question, fragments)
-        last_error: Optional[Exception] = None
-
-        for model_name in self._get_fallback_model_names():
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    user_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
-                    ),
-                )
-                if not response.text:
-                    raise ValueError("Empty response from Gemini API")
-                self.model_name = model_name
-                self.model = model
-                return response.text
-            except Exception as e:
-                last_error = e
-                message = str(e).lower()
-                retryable = (
-                    "404" in message
-                    or "not found" in message
-                    or "not supported" in message
-                    or "quota" in message
-                    or "rate limit" in message
-                    or "exceeded" in message
-                )
-                if not retryable:
-                    break
-
-        raise Exception(f"Gemini API call failed: {str(last_error)}")
+        user_prompt = self._build_user_prompt(question, fragments, chat_history)
+        
+        return self._call_gemini_sdk(user_prompt, temperature, max_tokens)
 
     def generate_rag_response(
         self,
         question: str,
         fragments: List[Dict[str, Any]],
+        chat_history: Optional[str] = None,
         temperature: float = 0.3
     ) -> Dict[str, Any]:
         """Generate response with or without fragments - let Gemini handle both cases."""
-        answer = self.generate_response(question=question, fragments=fragments, temperature=temperature)
+        answer = self.generate_response(
+            question=question,
+            fragments=fragments,
+            chat_history=chat_history,
+            temperature=temperature
+        )
         return {
             "answer": answer,
             "fragments_used": len(fragments),
@@ -243,50 +139,16 @@ INSTRUCTIONS:
         question: str,
         temperature: float = 0.3,
     ) -> Dict[str, Any]:
-        if not question or not question.strip():
-            raise ValueError("Question cannot be empty")
-
-        max_tokens = settings.max_tokens
-        fallback_prompt = self._build_fallback_prompt(question)
-        last_error: Optional[Exception] = None
-
-        for model_name in self._get_fallback_model_names():
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(
-                    fallback_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
-                    ),
-                )
-                if not response.text:
-                    raise ValueError("Empty response from Gemini API")
-                self.model_name = model_name
-                self.model = model
-                return {
-                    "answer": response.text,
-                    "fragments_used": 0,
-                    "fragments": [],
-                }
-            except Exception as e:
-                last_error = e
-                message = str(e).lower()
-                retryable = (
-                    "404" in message
-                    or "not found" in message
-                    or "not supported" in message
-                    or "quota" in message
-                    or "rate limit" in message
-                    or "exceeded" in message
-                )
-                if not retryable:
-                    break
-
-        raise Exception(f"Gemini API call failed: {str(last_error)}")
+        rag_response = self.generate_rag_response(
+            question=question,
+            fragments=[],
+            chat_history=None, # No history in fallback
+            temperature=temperature
+        )
+        return rag_response
 
 
-_gemini_service: GeminiService = None
+_gemini_service: Optional[GeminiService] = None
 
 def get_gemini_service() -> GeminiService:
     global _gemini_service

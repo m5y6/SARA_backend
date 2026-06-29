@@ -90,6 +90,42 @@ class DatabaseService:
             if conn:
                 conn.close()
 
+    def get_session_owner(self, sesion_id: int) -> Optional[int]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT usuario_id FROM sesiones_chat WHERE id = %s", (sesion_id,))
+            result = cursor.fetchone()
+            return result["usuario_id"] if result else None
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to get session owner: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_chat_history(self, sesion_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(
+                """
+                SELECT pregunta_usuario, respuesta_ia
+                FROM interacciones
+                WHERE sesion_id = %s
+                ORDER BY fecha_hora DESC
+                LIMIT %s
+                """,
+                (sesion_id, limit),
+            )
+            return cursor.fetchall()
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to get chat history: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
     def health_check(self) -> bool:
         conn = None
         try:

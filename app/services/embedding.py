@@ -3,6 +3,7 @@ Embedding service using fastembed.
 Converts text into vector embeddings for semantic search.
 """
 
+import os
 from typing import List, Any
 from app.core.config import settings
 
@@ -21,7 +22,14 @@ class EmbeddingService:
             self.model = None
             return
 
-        self.model: Any = TextEmbedding(model_name=self.model_name)
+        # Define a consistent cache directory within the project.
+        # fastembed will check this directory for a pre-existing model
+        # and download it here if it's missing.
+        model_cache_dir = os.path.abspath("app/models")
+        print(f"Fastembed cache directory is set to: {model_cache_dir}")
+
+        # Always try to load the model by name. fastembed will handle caching.
+        self.model: Any = TextEmbedding(model_name=self.model_name, cache_dir=model_cache_dir)
 
     def embed_text(self, text: str) -> List[float]:
         if not text or not text.strip():

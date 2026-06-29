@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["SARA"])
 
 
-class QuestionRequest(BaseModel):
+class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=500)
     temperature: Optional[float] = Field(0.3, ge=0.0, le=1.0)
     sesion_id: Optional[int] = None
+    usuario_id: int = 1
 
 
 class FragmentInfo(BaseModel):
@@ -35,11 +36,12 @@ class FragmentInfo(BaseModel):
     similarity: float
 
 
-class QuestionResponse(BaseModel):
+class ChatResponse(BaseModel):
     answer: str
     fragments_used: int
     fragments: List[FragmentInfo]
     model: str
+    sesion_id: int
 
 
 class HealthResponse(BaseModel):
@@ -108,18 +110,20 @@ class ListDocumentsResponse(BaseModel):
 
 def _get_session_id_for_request(
     db_service,
-    request: QuestionRequest,
+    request: ChatRequest,
     current_user: Dict[str, Any],
 ) -> int:
+    user_id = int(current_user.get("user_id", request.usuario_id))
+
     if request.sesion_id:
         session_owner = db_service.get_session_owner(request.sesion_id)
         if session_owner is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
-        if int(session_owner) != int(current_user["user_id"]):
+        if session_owner != user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Session does not belong to current user")
         return request.sesion_id
 
-    return db_service.create_session(int(current_user["user_id"]))
+    return db_service.create_session(user_id)
 
 
 @router.post("/auth/login", response_model=LoginResponse)
@@ -149,30 +153,34 @@ async def login(request: LoginRequest) -> LoginResponse:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Login failed")
 
 
-@router.post("/ask", response_model=QuestionResponse)
-async def ask_question(
-    request: QuestionRequest,
+@router.post("/chat", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
-) -> QuestionResponse:
+) -> ChatResponse:
     try:
         db_service = get_database_service()
+        
+        user_id = int(current_user.get("user_id", request.usuario_id))
+
+        sesion_id = _get_session_id_for_request(db_service, request, current_user)
 
         logger.info(
-            "ASK request received | user_id=%s | question=%s",
-            current_user.get("user_id"),
+            "CHAT request received | user_id=%s | sesion_id=%s | question=%s",
+            user_id,
+            sesion_id,
             request.question[:120],
         )
 
-        logger.info(f"Generating embedding for question: {request.question[:50]}...")
+        history = db_service.get_chat_history(sesion_id)
+        history.reverse()
+        chat_history_str = "\n".join(
+            [f"Estudiante: {h['pregunta_usuario']}\nSARA: {h['respuesta_ia']}" for h in history]
+        )
+
         embedding_service = get_embedding_service()
         try:
             question_embedding = embedding_service.embed_text(request.question)
-            logger.info(
-                "ASK retrieval embedding | model=%s | dim=%s | vector_length=%s",
-                settings.embedding_model,
-                settings.embedding_dim,
-                len(question_embedding),
-            )
         except RuntimeError as e:
             logger.error(f"Embedding service unavailable: {str(e)}")
             question_embedding = None
@@ -182,60 +190,32 @@ async def ask_question(
         
         fragments = []
         if question_embedding is not None:
-            logger.info("Searching for similar fragments...")
             try:
                 fragments = db_service.search_similar_fragments(question_embedding)
             except Exception as e:
                 logger.error(f"Fragment search failed: {str(e)}")
-                fragments = []
         
         if not fragments:
             logger.warning(f"No fragments found")
-            logger.info("ASK mode: FALLBACK | vectorized fragments passed: 0 | only user question sent to Gemini")
-            try:
-                response_data = gemini_service.generate_fallback_response(
-                    question=request.question,
-                    temperature=request.temperature,
-                )
-            except Exception as e:
-                logger.error(f"Gemini fallback generation failed: {str(e)}")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="AI response service is unavailable right now",
-                )
+            logger.info("CHAT mode: FALLBACK | fragments: 0 | history: %s", "yes" if history else "no")
         else:
-            logger.info(f"Found {len(fragments)} fragments")
-            fragment_ids = [f.get("id") for f in fragments]
-            fragment_titles = [f.get("titulo") for f in fragments]
-            logger.info(
-                "ASK mode: RAG | vectorized fragments passed: %s | fragment_ids=%s",
-                len(fragments),
-                fragment_ids,
-            )
-            logger.info("ASK fragments titles: %s", fragment_titles)
-            logger.info(
-                "ASK fragments preview: %s",
-                [
-                    (f.get("titulo"), (f.get("contenido_texto") or f.get("contenido") or "")[:180])
-                    for f in fragments
-                ],
-            )
-            logger.info("Generating response...")
-            try:
-                response_data = gemini_service.generate_rag_response(
-                    question=request.question,
-                    fragments=fragments,
-                    temperature=request.temperature
-                )
-            except Exception as e:
-                logger.error(f"Gemini response generation failed: {str(e)}")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="AI response service is unavailable right now",
-                )
-        tiempo_ms = int((time.time() - start_ts) * 1000)
+            logger.info("CHAT mode: RAG | fragments: %s | history: %s", len(fragments), "yes" if history else "no")
 
-        sesion_id = _get_session_id_for_request(db_service, request, current_user)
+        try:
+            response_data = gemini_service.generate_rag_response(
+                question=request.question,
+                fragments=fragments,
+                chat_history=chat_history_str,
+                temperature=request.temperature
+            )
+        except Exception as e:
+            logger.error(f"Gemini response generation failed: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI response service is unavailable right now",
+            )
+        
+        tiempo_ms = int((time.time() - start_ts) * 1000)
 
         vector_ids = [f["id"] for f in fragments]
         try:
@@ -259,12 +239,13 @@ async def ask_question(
             for f in fragments
         ]
         
-        logger.info("Question processed successfully")
-        return QuestionResponse(
+        logger.info("Chat request processed successfully")
+        return ChatResponse(
             answer=response_data["answer"],
             fragments_used=response_data["fragments_used"],
             fragments=formatted_fragments,
-            model="gemini-1.5-flash"
+            model=gemini_service.model_name,
+            sesion_id=sesion_id,
         )
         
     except ValueError as e:
@@ -273,8 +254,8 @@ async def ask_question(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing question: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error processing your question.")
+        logger.error(f"Error processing chat request: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error processing your request.")
 
 
 @router.get("/health", response_model=HealthResponse)
