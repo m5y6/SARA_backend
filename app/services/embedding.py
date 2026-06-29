@@ -4,8 +4,11 @@ Converts text into vector embeddings for semantic search.
 """
 
 import os
+import logging
 from typing import List, Any
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
@@ -26,7 +29,7 @@ class EmbeddingService:
         # fastembed will check this directory for a pre-existing model
         # and download it here if it's missing.
         model_cache_dir = os.path.abspath("app/models")
-        print(f"Fastembed cache directory is set to: {model_cache_dir}")
+        logger.info(f"Fastembed cache directory is set to: {model_cache_dir}")
 
         # Always try to load the model by name. fastembed will handle caching.
         self.model: Any = TextEmbedding(model_name=self.model_name, cache_dir=model_cache_dir)

@@ -16,18 +16,7 @@ class S3StorageService:
         self.bucket_name = bucket_name or settings.s3_bucket_name
         self.region_name = region_name or settings.aws_region
         self.prefix = settings.s3_prefix.strip("/")
-        client_kwargs = {"region_name": self.region_name}
-        if settings.aws_access_key_id and settings.aws_secret_access_key:
-            client_kwargs["aws_access_key_id"] = settings.aws_access_key_id
-            client_kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
-            if settings.aws_session_token:
-                client_kwargs["aws_session_token"] = settings.aws_session_token
-        elif settings.aws_profile:
-            session = boto3.Session(profile_name=settings.aws_profile, region_name=self.region_name)
-            self.client = session.client("s3")
-            return
-
-        self.client = boto3.client("s3", **client_kwargs)
+        self.client = boto3.client("s3", region_name=self.region_name)
 
     @staticmethod
     def build_object_name(file_name: str) -> str:

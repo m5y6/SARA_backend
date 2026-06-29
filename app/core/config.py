@@ -26,11 +26,6 @@ class Settings(BaseSettings):
     max_tokens: int = 2048
     top_k_fragments: int = 3
     similarity_threshold: float = 0.65
-    aws_region: str = "us-east-1"
-    aws_access_key_id: str | None = None
-    aws_secret_access_key: str | None = None
-    aws_session_token: str | None = None
-    aws_profile: str | None = None
     s3_bucket_name: str
     s3_prefix: str = "documents/"
     jwt_secret_key: str
