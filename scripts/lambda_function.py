@@ -15,7 +15,7 @@ from fastembed import TextEmbedding
 
 # --- Configuration ---
 # The S3 bucket where the model zip file is stored.
-BUCKET_NAME = "sara-repository-duoc"
+BUCKET_NAME = "sara-repository-duoc2"
 # The name of the multilingual model being used.
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 # The S3 key (filename) of the zip file containing the model.
