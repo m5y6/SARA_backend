@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     max_tokens: int = 2048
     top_k_fragments: int = 3
     similarity_threshold: float = 0.65
+    aws_region: str
     s3_bucket_name: str
     s3_prefix: str = "documents/"
     jwt_secret_key: str
