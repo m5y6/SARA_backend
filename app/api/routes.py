@@ -15,7 +15,7 @@ from app.services.llm_gemini import get_gemini_service
 from app.core.config import settings
 from app.services.text_normalization import normalize_text, prepare_document_text, extract_uploaded_document_text
 from app.services.s3_storage import get_s3_storage_service
-from app.services.auth import authenticate_user, create_access_token, get_current_user, require_admin, require_permission, require_admin_or_permission
+from app.services.auth import login_user, create_access_token, get_current_user, require_admin, require_permission, require_admin_or_permission
 import logging
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ def _get_session_id_for_request(
 @router.post("/auth/login", response_model=LoginResponse)
 async def login(request: LoginRequest) -> LoginResponse:
     try:
-        user = authenticate_user(request.email, request.password)
+        user = login_user(request.email, request.password)
         token = create_access_token({
             "sub": user["sub"],
             "user_id": user["user_id"],
