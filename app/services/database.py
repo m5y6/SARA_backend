@@ -9,7 +9,8 @@ from typing import List, Dict, Any, Optional
 from app.core.config import settings
 from passlib.context import CryptContext
 
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+# Cambiar pbkdf2_sha256 por bcrypt para que coincida con la autenticación
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 class DatabaseService:
@@ -632,6 +633,45 @@ class DatabaseService:
             if conn:
                 conn.rollback()
             raise Exception(f"Failed to create user: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def get_user_for_auth(self, email: str) -> Optional[Dict[str, Any]]:
+        """Busca un usuario por su email trayendo su rol y permisos para JWT."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            # Usamos RealDictCursor para que devuelva un diccionario directo por clave
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            query = """
+                SELECT 
+                    u.id, 
+                    u.nombre, 
+                    u.email, 
+                    u.password_hash, 
+                    r.nombre AS role_name, 
+                    r.permisos
+                FROM usuarios u
+                LEFT JOIN roles r ON u.rol_id = r.id
+                WHERE u.email = %s
+            """
+            cursor.execute(query, (email,))
+            row = cursor.fetchone()
+            
+            if row:
+                return {
+                    "id": row["id"],
+                    "nombre": row["nombre"],
+                    "email": row["email"],
+                    "password": row["password_hash"],  # Mapeado como 'password' para calzar con auth.py
+                    "role_name": row["role_name"],
+                    "permisos": row["permisos"]
+                }
+            return None
+        except psycopg2.Error as e:
+            raise Exception(f"Failed to get user for auth: {str(e)}")
         finally:
             if conn:
                 conn.close()
