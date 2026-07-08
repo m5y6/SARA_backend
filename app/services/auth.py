@@ -1,151 +1,64 @@
-"""
-Authentication helpers for SARA.
-Provides password verification, JWT creation, and current user lookups.
-"""
-
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
-
-import jwt
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from passlib.context import CryptContext
-
-from app.core.config import settings
-from app.services.database import get_database_service
-
-
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
-bearer_scheme = HTTPBearer(auto_error=False)
-
-
+import sqlite3
 import bcrypt
+import os
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
-    except Exception:
-        return False
+# Ruta a la base de datos
+db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'SARA.db')
 
+def hash_password(password):
+    """Hashea una contraseña."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+def verify_password(stored_password, provided_password):
+    """Verifica una contraseña hasheada."""
+    return bcrypt.checkpw(provided_password.encode('utf-8'), stored_password)
 
-
-def create_access_token(data: Dict[str, Any], expires_minutes: Optional[int] = None) -> str:
-    payload = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes or settings.access_token_expire_minutes)
-    payload.update({"exp": expire})
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
-
-
-def decode_access_token(token: str) -> Dict[str, Any]:
-    try:
-        return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> Dict[str, Any]:
-    if credentials is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    payload = decode_access_token(credentials.credentials)
-    return payload
-
-
-def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    # Admin can be granted either by role name or by a permission flag in `permisos`.
-    role = current_user.get("role")
-    permisos = current_user.get("permisos")
-    is_admin = role == "admin"
-    if not is_admin:
-        # check permisos: dict with 'admin': true, or list containing 'admin'
-        if isinstance(permisos, dict):
-            is_admin = bool(permisos.get("admin"))
-        elif isinstance(permisos, (list, tuple)):
-            is_admin = "admin" in permisos
-
-    if not is_admin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
-    return current_user
-
-
-def require_permission(permission: str):
-    def _dependency(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-        permisos = current_user.get("permisos")
-        if not permisos:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission '{permission}' required")
-        if isinstance(permisos, dict):
-            if permisos.get(permission):
-                return current_user
-        elif isinstance(permisos, (list, tuple)):
-            if permission in permisos:
-                return current_user
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission '{permission}' required")
-
-    return _dependency
-
-
-def require_admin_or_permission(permission: str):
-    def _dependency(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-        # Admin always allowed
-        if current_user.get("role") == "admin":
-            return current_user
-        # Otherwise check permisos
-        permisos = current_user.get("permisos")
-        if not permisos:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission '{permission}' required")
-        if isinstance(permisos, dict):
-            if permisos.get(permission):
-                return current_user
-        elif isinstance(permisos, (list, tuple)):
-            if permission in permisos:
-                return current_user
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission '{permission}' required")
-
-    return _dependency
-
-
-def authenticate_user(email: str, password: str) -> Dict[str, Any]:
-    db_service = get_database_service()
+def register_user(email, password, nombre=None, telefono=None, fecha_nacimiento=None):
+    """Registra un nuevo usuario en la base de datos."""
     conn = None
     try:
-        conn = db_service._get_connection()
-        cursor = conn.cursor(cursor_factory=None)
-        cursor.execute(
-            """
-            SELECT u.id, u.nombre, u.email, u.password_hash, r.nombre AS role_name, r.permisos AS role_permisos
-            FROM usuarios u
-            LEFT JOIN roles r ON u.rol_id = r.id
-            WHERE u.email = %s
-            """,
-            (email,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
 
-        user_id, nombre, user_email, password_hash, role_name, role_permisos = row
-        try:
-            password_valid = verify_password(password, password_hash)
-        except Exception:
-            # Stored hash is invalid/corrupted or not from passlib; treat as bad credentials.
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        # Verificar si el usuario ya existe
+        cursor.execute("SELECT id FROM usuarios WHERE email = ?", (email,))
+        if cursor.fetchone():
+            return None  # Usuario ya existe
 
-        if not password_valid:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+        hashed_password = hash_password(password)
 
-        role_slug = (role_name or "").strip().lower()
-        if role_slug in {"admin", "administrador"}:
-            role_slug = "admin"
-        return {
-            "sub": str(user_id),
-            "user_id": user_id,
-            "name": nombre,
-            "email": user_email,
-            "role": role_slug,
-            "permisos": role_permisos,
-        }
+        cursor.execute("""
+            INSERT INTO usuarios (email, password, nombre, telefono, fecha_nacimiento)
+            VALUES (?, ?, ?, ?, ?)
+        """, (email, hashed_password, nombre, telefono, fecha_nacimiento))
+
+        conn.commit()
+        user_id = cursor.lastrowid
+        return (user_id,) # Devolver como tupla para consistencia con el route
+    except sqlite3.Error as e:
+        print(f"Error de base de datos: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def login_user(email, password):
+    """Autentica a un usuario."""
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id, password FROM usuarios WHERE email = ?", (email,))
+        user_row = cursor.fetchone()
+
+        if user_row and verify_password(user_row[1], password):
+            return (user_row[0],) # Devolver como tupla
+        else:
+            return None
+    except sqlite3.Error as e:
+        print(f"Error de base de datos: {e}")
+        return None
     finally:
         if conn:
             conn.close()

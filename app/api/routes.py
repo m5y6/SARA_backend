@@ -432,6 +432,14 @@ class AdminUserUpdate(BaseModel):
     role_name: Optional[str] = None
 
 
+class AdminCreateUserRequest(BaseModel):
+    email: str = Field(..., example="new.user@example.com")
+    password: str = Field(..., min_length=8)
+    nombre: Optional[str] = Field(None, example="New User")
+    role_id: Optional[int] = Field(None, example=2)
+    role_name: Optional[str] = Field(None, example="user")
+
+
 class UpdatePermisosRequest(BaseModel):
     permisos: Optional[Dict[str, Any]] = None
 
@@ -471,6 +479,42 @@ async def admin_get_user(user_id: int, current_user: Dict[str, Any] = Depends(re
     except Exception as e:
         logger.error(f"Get user error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get user")
+
+
+@router.post("/admin/users", response_model=AdminUser, status_code=status.HTTP_201_CREATED)
+async def admin_create_user(
+    request: AdminCreateUserRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+) -> AdminUser:
+    try:
+        db = get_database_service()
+        
+        role_id = request.role_id
+        if role_id is None and request.role_name:
+            role = db.get_role_by_name(request.role_name)
+            if not role:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Role '{request.role_name}' not found")
+            role_id = role["id"]
+        
+        new_user = db.create_user(
+            email=request.email,
+            password=request.password,
+            nombre=request.nombre,
+            role_id=role_id,
+            performed_by=current_user.get("user_id"),
+        )
+        
+        # Refetch user to get role name
+        created_user = db.get_user(new_user["id"])
+        return AdminUser(**created_user)
+        
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create user error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create user")
 
 
 @router.patch("/admin/users/{user_id}", response_model=AdminUser)

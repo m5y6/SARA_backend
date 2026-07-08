@@ -7,6 +7,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Dict, Any, Optional
 from app.core.config import settings
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 
 class DatabaseService:
@@ -589,6 +592,46 @@ class DatabaseService:
             if conn:
                 conn.rollback()
             raise Exception(f"Failed to update user: {str(e)}")
+        finally:
+            if conn:
+                conn.close()
+
+    def create_user(self, email: str, password: str, nombre: Optional[str] = None, role_id: Optional[int] = None, performed_by: Optional[int] = None) -> Dict[str, Any]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            # Check if user already exists
+            cursor.execute("SELECT id FROM usuarios WHERE email = %s", (email,))
+            if cursor.fetchone():
+                raise ValueError("User with this email already exists")
+
+            password_hash = pwd_context.hash(password)
+
+            cursor.execute(
+                """
+                INSERT INTO usuarios (email, password_hash, nombre, rol_id)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, email, nombre, rol_id
+                """,
+                (email, password_hash, nombre, role_id)
+            )
+            new_user = cursor.fetchone()
+
+            # Audit log
+            if performed_by:
+                cursor.execute(
+                    "INSERT INTO role_audit_log (action, performed_by, target_user, role_id, details) VALUES (%s,%s,%s,%s,%s)",
+                    ("create_user", performed_by, new_user["id"], role_id, f"New user {email} created"),
+                )
+
+            conn.commit()
+            return new_user
+        except psycopg2.Error as e:
+            if conn:
+                conn.rollback()
+            raise Exception(f"Failed to create user: {str(e)}")
         finally:
             if conn:
                 conn.close()
